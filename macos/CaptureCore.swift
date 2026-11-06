@@ -79,7 +79,7 @@ struct ScrollAssembler {
 }
 
 struct CaptureMark {
-    enum Kind { case rectangle, text }
+    enum Kind { case rectangle, text, redact }
     var kind: Kind
     var rect: CGRect
     var text = ""
@@ -114,6 +114,10 @@ func drawMark(_ mark: CaptureMark) {
     mark.color.setStroke()
     if mark.kind == .rectangle {
         let path = NSBezierPath(rect: mark.rect); path.lineWidth = mark.lineWidth; path.stroke()
+    } else if mark.kind == .redact {
+        // Always opaque, independent of annotation color and stroke settings.
+        NSColor.black.setFill()
+        NSBezierPath(rect: mark.rect.integral).fill()
     } else {
         (mark.text as NSString).draw(in: mark.rect, withAttributes: [.font: NSFont.systemFont(ofSize: mark.fontSize), .foregroundColor: mark.color])
     }
