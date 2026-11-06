@@ -109,7 +109,10 @@ fn read_from(board: &NSPasteboard) -> (isize, Content) {
     )
 }
 
+static ACCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn read_content() -> (isize, Content) {
+    let _access = ACCESS.lock().unwrap();
     autoreleasepool(|_| read_from(&NSPasteboard::generalPasteboard()))
 }
 
@@ -127,6 +130,7 @@ fn read_update_from(
 }
 
 pub fn read_update(previous: isize, initial: bool) -> Option<(isize, Content)> {
+    let _access = ACCESS.lock().unwrap();
     autoreleasepool(|_| read_update_from(&NSPasteboard::generalPasteboard(), previous, initial))
 }
 
@@ -154,6 +158,21 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn identical_peer_echo_does_not_trigger_another_clipboard_update() {
+        autoreleasepool(|_| {
+            let board = TestBoard(NSPasteboard::pasteboardWithUniqueName());
+            let count = write_to(&board.0, "synthetic shared text").unwrap();
+            assert_eq!(write_to(&board.0, "synthetic shared text").unwrap(), count);
+            assert!(read_update_from(&board.0, count, false).is_none());
+            let next = write_to(&board.0, "new shared text").unwrap();
+            assert_ne!(next, count);
+            assert!(
+                matches!(read_update_from(&board.0, count, false), Some((_, Content::Text(text))) if text == "new shared text")
+            );
+        });
+    }
+
     #[test]
     fn copied_image_overrides_text_and_is_reoffered_on_reconnect() {
         autoreleasepool(|_| {
@@ -313,17 +332,29 @@ mod tests {
 }
 
 pub fn change_count() -> isize {
+    let _access = ACCESS.lock().unwrap();
     autoreleasepool(|_| NSPasteboard::generalPasteboard().changeCount())
 }
 
 pub fn write(text: &str) -> anyhow::Result<isize> {
-    autoreleasepool(|_| {
-        let board = NSPasteboard::generalPasteboard();
-        board.clearContents();
-        anyhow::ensure!(
-            board.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString }),
-            "macOS rejected text clipboard write"
-        );
-        Ok(board.changeCount())
-    })
+    let _access = ACCESS.lock().unwrap();
+    autoreleasepool(|_| write_to(&NSPasteboard::generalPasteboard(), text))
+}
+
+fn write_to(board: &NSPasteboard, text: &str) -> anyhow::Result<isize> {
+    // Multiple peers may echo the same text. Preserve the change count so
+    // their acknowledgements do not trigger another broadcast cycle.
+    if board
+        .stringForType(unsafe { NSPasteboardTypeString })
+        .is_some_and(|s| s.to_string() == text)
+        && matches!(read_from(board).1, Content::Text(_))
+    {
+        return Ok(board.changeCount());
+    }
+    board.clearContents();
+    anyhow::ensure!(
+        board.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString }),
+        "macOS rejected text clipboard write"
+    );
+    Ok(board.changeCount())
 }

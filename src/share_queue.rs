@@ -161,19 +161,27 @@ pub(crate) fn validate_selected(target: std::net::SocketAddr) -> anyhow::Result<
 }
 /// Inspect only ready, unclaimed requests. Opening the share sheet or loading
 /// files does not create one: the user must first click a device to send.
-pub fn pending_target() -> Option<std::net::SocketAddr> {
-    let root = root()?;
-    let entries = std::fs::read_dir(root).ok()?;
+pub fn pending_targets() -> Vec<std::net::SocketAddr> {
+    pending_targets_in(root().as_deref())
+}
+fn pending_targets_in(root: Option<&Path>) -> Vec<std::net::SocketAddr> {
+    let mut targets = Vec::new();
+    let Some(root) = root else { return targets };
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return targets;
+    };
     for entry in entries.flatten() {
         let dir = entry.path();
         if dir.extension().is_none_or(|e| e != "ready") || dir.join("status.json").exists() {
             continue;
         }
-        let metadata = entry.metadata().ok()?;
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
         if !metadata.is_dir()
             || metadata
                 .modified()
-                .ok()?
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
                 .elapsed()
                 .unwrap_or_default()
                 .as_secs()
@@ -182,17 +190,22 @@ pub fn pending_target() -> Option<std::net::SocketAddr> {
             continue;
         }
         let path = dir.join("request.json");
-        if std::fs::metadata(&path).ok()?.len() > 65536 {
+        if std::fs::metadata(&path).map_or(true, |m| m.len() > 65536) {
             continue;
         }
-        let Ok(data) = serde_json::from_slice::<Description>(&std::fs::read(path).ok()?) else {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        let Ok(data) = serde_json::from_slice::<Description>(&bytes) else {
             continue;
         };
         if validate_selected(data.target).is_ok() {
-            return Some(data.target);
+            if !targets.contains(&data.target) {
+                targets.push(data.target);
+            }
         }
     }
-    None
+    targets
 }
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShareDevice {
@@ -212,26 +225,38 @@ pub fn take_device_refresh() -> bool {
         .and_then(|p| p.parent().map(|p| p.join("refresh-devices")))
         .is_some_and(|p| std::fs::remove_file(p).is_ok())
 }
+static PUBLISH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static DISCOVERED: std::sync::Mutex<Vec<ShareDevice>> = std::sync::Mutex::new(Vec::new());
-static CONNECTED: std::sync::Mutex<Option<std::net::SocketAddr>> = std::sync::Mutex::new(None);
-pub fn set_connected(target: Option<std::net::SocketAddr>) {
-    *CONNECTED.lock().unwrap() = target;
+static CONNECTED: std::sync::Mutex<Vec<std::net::SocketAddr>> = std::sync::Mutex::new(Vec::new());
+pub fn discovered_devices() -> Vec<ShareDevice> {
+    DISCOVERED.lock().unwrap().clone()
+}
+pub fn set_connected(target: std::net::SocketAddr, connected: bool) {
+    let _publish = PUBLISH.lock().unwrap();
+    let mut targets = CONNECTED.lock().unwrap();
+    targets.retain(|endpoint| *endpoint != target);
+    if connected {
+        targets.push(target);
+    }
+    drop(targets);
     let devices = DISCOVERED.lock().unwrap().clone();
     let _ = write_devices(devices);
 }
 /// Short-lived, private device catalogue for the sandboxed picker. No account
 /// information, certificates, clipboard data, or file contents enter this file.
 pub fn publish_devices(devices: Vec<ShareDevice>) -> anyhow::Result<()> {
+    let _publish = PUBLISH.lock().unwrap();
     *DISCOVERED.lock().unwrap() = devices.clone();
     write_devices(devices)
 }
 fn write_devices(mut devices: Vec<ShareDevice>) -> anyhow::Result<()> {
-    if let Some(endpoint) = *CONNECTED.lock().unwrap()
-        && !devices.iter().any(|d| d.endpoint == endpoint)
-    {
+    for endpoint in CONNECTED.lock().unwrap().iter().copied() {
+        if devices.iter().any(|d| d.endpoint == endpoint) {
+            continue;
+        }
         devices.push(ShareDevice {
-            name: "已连接的手机".into(),
-            device_type: 1,
+            name: "已连接的设备".into(),
+            device_type: 0,
             endpoint,
         });
     }
@@ -298,6 +323,39 @@ mod tests {
 mod selection_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn multiple_pending_targets_are_discovered_and_claimed_separately() {
+        let root = std::env::temp_dir().join(format!(
+            "clip-multi-{:016x}",
+            u64::from_ne_bytes(crate::private::random().unwrap())
+        ));
+        let targets = [
+            "127.0.0.1:1".parse().unwrap(),
+            "127.0.0.1:2".parse().unwrap(),
+        ];
+        for (index, target) in targets.iter().enumerate() {
+            let dir = root.join(format!("{index}.ready"));
+            std::fs::create_dir_all(dir.join("files")).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(dir.join("files/test.txt"), b"synthetic").unwrap();
+            std::fs::write(
+                dir.join("request.json"),
+                serde_json::to_vec(&serde_json::json!({"files": ["test.txt"], "target": target}))
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(pending_targets_in(Some(&root)).len(), 2);
+        let first = Request::next_for(&root, Some(targets[0])).unwrap().unwrap();
+        assert_eq!(pending_targets_in(Some(&root)), vec![targets[1]]);
+        let second = Request::next_for(&root, Some(targets[1])).unwrap().unwrap();
+        assert_eq!(first.target, targets[0]);
+        assert_eq!(second.target, targets[1]);
+        assert!(pending_targets_in(Some(&root)).is_empty());
+        drop((first, second));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn queued_selection_never_falls_back_to_another_connected_phone() {
         let root = std::env::temp_dir().join(format!(

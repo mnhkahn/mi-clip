@@ -568,7 +568,7 @@ pub enum SyncEvent {
 }
 
 pub fn probe(config: &Path, directory: &Path) -> anyhow::Result<()> {
-    exchange(config, Some(directory), None, &|event| {
+    exchange(config, Some(directory), None, None, &|event| {
         #[cfg(feature = "research")]
         if matches!(
             event,
@@ -587,13 +587,30 @@ pub fn sync_once(
     stop: &std::sync::atomic::AtomicBool,
     on_event: &dyn Fn(SyncEvent),
 ) -> anyhow::Result<()> {
-    exchange(config, None, Some(stop), on_event)
+    exchange(config, None, Some(stop), None, on_event)
+}
+
+/// Run one independent authenticated session to a specific discovered device.
+#[cfg(feature = "clipboard")]
+pub fn sync_target(
+    config: &Path,
+    target: SocketAddr,
+    stop: &std::sync::atomic::AtomicBool,
+    on_event: &dyn Fn(SyncEvent),
+) -> anyhow::Result<()> {
+    exchange(config, None, Some(stop), Some(target), on_event)
+}
+
+pub fn configured_endpoint(config: &Path) -> anyhow::Result<Option<SocketAddr>> {
+    let config: ProbeConfig = serde_json::from_slice(&std::fs::read(config)?)?;
+    Ok((config.endpoint.port() != 0).then_some(config.endpoint))
 }
 
 fn exchange(
     config: &Path,
     directory: Option<&Path>,
     stop: Option<&std::sync::atomic::AtomicBool>,
+    target: Option<SocketAddr>,
     on_event: &dyn Fn(SyncEvent),
 ) -> anyhow::Result<()> {
     macro_rules! diagnostic { ($($arg:tt)*) => { if directory.is_some() { println!($($arg)*); } }; }
@@ -625,20 +642,12 @@ fn exchange(
     config
         .services
         .get_or_insert_with(crate::networking::Service::local_services);
-    #[cfg(feature = "file-sharing")]
-    let selected_target = if stop.is_some() {
-        crate::share_queue::pending_target()
-    } else {
-        None
-    };
-    #[cfg(not(feature = "file-sharing"))]
-    let selected_target: Option<SocketAddr> = None;
+    let selected_target = target;
     if stop.is_some() && selected_target.is_none() {
         use std::net::ToSocketAddrs;
         if let Ok(endpoints) = crate::discovery::discover(Duration::from_secs(3)) {
             if let Some(address) = endpoints
                 .iter()
-                .filter(|e| e.device_type == 1)
                 .filter_map(|e| (e.host.as_str(), e.kcp_port).to_socket_addrs().ok())
                 .flatten()
                 .find(|a| a.is_ipv4())
@@ -783,15 +792,6 @@ fn exchange(
                     }
                     Ok(false) => (),
                 }
-            }
-            if stop.is_some()
-                && outgoing.is_none()
-                && crate::share_queue::pending_target()
-                    .is_some_and(|target| target != config.endpoint)
-            {
-                // Reconnect and authenticate the chosen phone. Never let a
-                // queued share silently fall back to a different live session.
-                return Ok(());
             }
             if stop.is_some()
                 && network_ready

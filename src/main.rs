@@ -1,4 +1,5 @@
 #![deny(unsafe_op_in_unsafe_fn)]
+mod capture;
 mod devices;
 mod notifications;
 mod probe;
@@ -124,12 +125,18 @@ fn main() -> anyhow::Result<()> {
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx: &mut App| {
             gpui_rhai::install(cx);
+            if !smoke {
+                capture::start();
+            }
             let quitting = background.clone();
             let mut instance = _instance;
             // AppKit terminate exits the process; code after application.run
             // is not a shutdown hook on macOS. Finish replacement here, before
             // returning control to the native termination callback.
             cx.on_app_quit(move |_| {
+                if !smoke {
+                    capture::stop();
+                }
                 quitting
                     .stop
                     .store(true, std::sync::atomic::Ordering::Relaxed);

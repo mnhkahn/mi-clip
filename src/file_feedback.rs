@@ -168,6 +168,72 @@ impl Feedback {
     }
 }
 
+/// Keep simultaneous transfers separate; a failed/disconnected peer must not
+/// overwrite another peer's active transfer or discard its progress.
+pub struct FeedbackGroup {
+    peers: std::collections::HashMap<Option<std::net::SocketAddr>, Feedback>,
+    latest: Option<std::net::SocketAddr>,
+}
+impl Default for FeedbackGroup {
+    fn default() -> Self {
+        Self {
+            peers: [(None, Feedback::default())].into(),
+            latest: None,
+        }
+    }
+}
+impl FeedbackGroup {
+    fn visible(&self) -> &Feedback {
+        self.peers
+            .values()
+            .filter(|feedback| feedback.active())
+            .max_by_key(|feedback| feedback.since)
+            .unwrap_or_else(|| &self.peers[&self.latest])
+    }
+    pub fn apply_for(
+        &mut self,
+        peer: Option<std::net::SocketAddr>,
+        event: Event,
+        now: Duration,
+    ) -> bool {
+        let changed = self.peers.entry(peer).or_default().apply(event, now);
+        if changed {
+            self.latest = peer;
+        }
+        changed
+    }
+    pub fn active(&self) -> bool {
+        self.peers.values().any(Feedback::active)
+    }
+    pub fn acknowledge(&mut self) {
+        for feedback in self.peers.values_mut() {
+            feedback.acknowledge();
+        }
+    }
+    pub fn tick(&mut self, now: Duration) -> bool {
+        let mut changed = false;
+        for feedback in self.peers.values_mut() {
+            changed |= feedback.tick(now);
+        }
+        changed
+    }
+    pub fn appearance(&self, now: Duration) -> (Icon, usize, bool) {
+        self.visible().appearance(now)
+    }
+    pub fn detail(&self) -> Option<String> {
+        let active = self
+            .peers
+            .values()
+            .filter(|feedback| feedback.active())
+            .count();
+        if active > 1 {
+            Some(format!("正在接收文件 · {active} 台设备"))
+        } else {
+            self.visible().detail()
+        }
+    }
+}
+
 /// Tiny vector frames, decoded lazily by AppKit. No bitmap assets or UI runtime.
 pub fn icon_pdf(icon: Icon, frame: usize) -> Vec<u8> {
     use std::fmt::Write;
@@ -348,5 +414,49 @@ mod tests {
         );
         assert!(feedback.apply(Event::Requested, Duration::from_secs(21)));
         assert!(feedback.active());
+    }
+}
+
+#[cfg(test)]
+mod multi_tests {
+    use super::*;
+    #[test]
+    fn disconnect_and_completion_do_not_interrupt_other_peers() {
+        let first = Some("192.0.2.1:1".parse().unwrap());
+        let second = Some("192.0.2.2:1".parse().unwrap());
+        let mut feedback = FeedbackGroup::default();
+        for peer in [first, second] {
+            assert!(feedback.apply_for(peer, Event::Requested, Duration::ZERO));
+            assert!(feedback.apply_for(
+                peer,
+                Event::Progress {
+                    received: 1,
+                    total: 10
+                },
+                Duration::ZERO
+            ));
+        }
+        assert!(feedback.detail().unwrap().contains("2 台设备"));
+        feedback.apply_for(
+            first,
+            Event::Failed(Failure::Disconnected),
+            Duration::from_secs(1),
+        );
+        assert!(feedback.active());
+        assert_eq!(
+            feedback.appearance(Duration::from_secs(1)).0,
+            Icon::Receiving
+        );
+        assert!(feedback.apply_for(
+            second,
+            Event::Progress {
+                received: 10,
+                total: 10
+            },
+            Duration::from_secs(2)
+        ));
+        assert!(feedback.apply_for(second, Event::Saved { files: 1 }, Duration::from_secs(2)));
+        assert!(!feedback.active());
+        assert_eq!(feedback.appearance(Duration::from_secs(2)).0, Icon::Saved);
     }
 }

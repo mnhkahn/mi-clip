@@ -32,3 +32,6 @@
 !/tools/build-app.sh
 
 !/tools/build-icon.swift
+
+!/build.rs
+!/tests/capture_test.swift

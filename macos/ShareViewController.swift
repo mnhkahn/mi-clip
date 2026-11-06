@@ -85,11 +85,17 @@ private struct ShareDeviceChoice {
     let type: Int
     var brand: ShareDeviceBrand? { ShareDeviceBrand.identify(name) }
     var detail: String { brand.map { "\($0.title) · \(kind)" } ?? kind }
+    private var isTablet: Bool {
+        type == 3 || (type == 2 && name.components(separatedBy: .alphanumerics.inverted)
+            .contains { $0.caseInsensitiveCompare("pad") == .orderedSame })
+    }
     var symbol: String {
-        switch type { case 1: return "iphone"; case 2: return "laptopcomputer"; case 3: return "ipad"; default: return "desktopcomputer" }
+        if isTablet { return "ipad" }
+        switch type { case 1: return "iphone"; case 2: return "laptopcomputer"; default: return "desktopcomputer" }
     }
     var kind: String {
-        switch type { case 1: return "手机"; case 2: return "电脑"; case 3: return "平板"; default: return "设备" }
+        if isTablet { return "平板电脑" }
+        switch type { case 1: return "手机"; case 2: return "电脑"; default: return "设备" }
     }
 }
 
@@ -464,7 +470,7 @@ final class ShareViewController: NSViewController {
         (controller.view.subviews.first as? NSImageView)?.image = NSImage(contentsOf: icon)
         let catalogue: [String: Any] = ["updated": Date().timeIntervalSince1970, "devices": [
             ["endpoint": "192.0.2.1:1234", "name": "Xiaomi 15 Pro", "device_type": 1],
-            ["endpoint": "192.0.2.2:1234", "name": "Redmi Pad", "device_type": 3],
+            ["endpoint": "192.0.2.2:1234", "name": "Redmi Pad", "device_type": 2],
             ["endpoint": "192.0.2.3:1234", "name": "MacBook Pro", "device_type": 2],
         ]]
         try JSONSerialization.data(withJSONObject: catalogue).write(to: root.appendingPathComponent("devices.json"))
@@ -472,7 +478,10 @@ final class ShareViewController: NSViewController {
         precondition(FileManager.default.fileExists(atPath: root.appendingPathComponent("refresh-devices").path), "Opening must automatically request discovery")
         precondition(controller.deviceButtons.count == 3)
         precondition(controller.choices.map { $0.brand } == [.xiaomi, .redmi, .apple])
-        precondition(controller.choices[1].detail == "Redmi · 平板")
+        precondition(controller.choices[1].detail == "Redmi · 平板电脑")
+        precondition(controller.choices[1].symbol == "ipad")
+        precondition(ShareDeviceChoice(endpoint: "", name: "Test tablet", type: 3).kind == "平板电脑")
+        precondition(ShareDeviceChoice(endpoint: "", name: "ThinkPad", type: 2).kind == "电脑")
         precondition(ShareDeviceBrand.identify("我的手机") == nil)
         precondition(ShareDeviceBrand.identify("2412DPC0AG") == nil)
         precondition(ShareDeviceBrand.identify("Galaxy S24") == .samsung)

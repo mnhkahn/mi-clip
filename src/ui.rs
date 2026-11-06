@@ -65,7 +65,7 @@ pub const PANEL_WIDTH: f32 = 280.0;
 pub fn panel_size(detail: &str) -> gpui_rhai::gpui::Size<gpui_rhai::gpui::Pixels> {
     gpui_rhai::gpui::size(
         px(PANEL_WIDTH),
-        px(content_height(detail) + 40.0 + 28.0 + 232.0),
+        px(content_height(detail) + 40.0 + 28.0 + 32.0 + 232.0),
     )
 }
 
@@ -253,15 +253,15 @@ impl Render for Panel {
                 },
             ));
         }
-        let has_phone = self.devices.entries.iter().any(|d| d.device_type == 1);
+        let has_device = !self.devices.entries.is_empty();
         let discovery_note = if self.devices.failed {
             "发现失败 · 列表为上次结果"
         } else if self.status == "已连接" {
             "双方认证通过 · 连接已建立"
-        } else if !has_phone {
-            "未发现手机 · 请解锁并开启互联"
+        } else if !has_device {
+            "未发现设备 · 请解锁并开启互联"
         } else {
-            "发现后自动连接同账号手机"
+            "发现后自动连接同账号设备"
         };
         self.host.container(
             div()
@@ -337,6 +337,36 @@ impl Render for Panel {
                                 .hover(|style| style.bg(rgba(0x2b3038ff)))
                                 .on_click(|_, _, cx| cx.quit())
                                 .child("退出"),
+                        ),
+                )
+                .child(
+                    div()
+                        .h(px(32.0))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px(px(14.0))
+                        .child(
+                            div()
+                                .id("capture")
+                                .cursor_pointer()
+                                .on_click(cx.listener(|panel, _, _, _| {
+                                    let _ = panel.events.try_send(crate::tray::TrayEvent::Capture);
+                                }))
+                                .child("截图"),
+                        )
+                        .child(
+                            div()
+                                .id("capture-settings")
+                                .cursor_pointer()
+                                .text_size(px(10.0))
+                                .on_click(cx.listener(|panel, _, _, _| {
+                                    let _ = panel
+                                        .events
+                                        .try_send(crate::tray::TrayEvent::CaptureSettings);
+                                }))
+                                .child("截图快捷键设置"),
                         ),
                 )
                 .child(

@@ -89,11 +89,9 @@ pub struct Peer {
 }
 impl Peer {
     pub fn can_share_files(&self) -> bool {
-        self.device_type == 1
-            && self
-                .services
-                .iter()
-                .any(|s| s.name == FILE_DISCOVERY && s.package == PHONE_PACKAGE)
+        self.services
+            .iter()
+            .any(|s| s.name == FILE_DISCOVERY && s.package == PHONE_PACKAGE)
             && self
                 .services
                 .iter()
@@ -190,6 +188,15 @@ mod tests {
         for command in [1, 2] {
             let phone = peer(&fixture(command, &[discovery.clone(), transfer.clone()])).unwrap();
             assert!(phone.can_share_files());
+            for device_type in [2, 3] {
+                let tablet = Peer {
+                    name: "Redmi Pad Pro".into(),
+                    id: phone.id.clone(),
+                    device_type,
+                    services: phone.services.clone(),
+                };
+                assert!(tablet.can_share_files());
+            }
             assert_eq!(phone.name, "Test phone");
             assert!(
                 !peer(&fixture(command, &[discovery.clone()]))

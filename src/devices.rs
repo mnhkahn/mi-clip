@@ -23,7 +23,15 @@ impl Device {
     pub fn kind(&self) -> &'static str {
         match self.device_type {
             1 => "手机",
+            2 if self
+                .name
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|word| word.eq_ignore_ascii_case("pad")) =>
+            {
+                "平板电脑"
+            }
             2 => "电脑",
+            3 => "平板电脑",
             _ => "设备",
         }
     }
@@ -33,28 +41,23 @@ pub(crate) struct Devices {
     pub entries: Vec<Device>,
     pub scanning: bool,
     pub failed: bool,
-    pub target: Option<SocketAddr>,
+    pub sessions: std::collections::HashMap<SocketAddr, (&'static str, String)>,
 }
 impl Devices {
-    pub fn rows(&self, status: &str) -> Vec<(String, String)> {
-        let target_state = match status {
-            "已连接" => "已连接 · 认证通过",
-            "连接中" => "连接中",
-            "认证中" => "认证中",
-            _ => "未连接 · 自动重试",
-        };
-        let mut matched = false;
+    pub fn rows(&self, _status: &str) -> Vec<(String, String)> {
+        let mut matched = std::collections::HashSet::new();
         let mut rows = Vec::new();
         for device in &self.entries {
-            let active = self.target.is_some_and(|a| device.addresses.contains(&a));
-            matched |= active;
-            let state = if active {
-                target_state
-            } else if device.device_type == 1 {
-                "已发现 · 未连接"
-            } else {
-                "已发现 · 暂不支持连接"
-            };
+            let session = device.addresses.iter().find_map(|a| {
+                self.sessions.get(a).map(|state| {
+                    matched.insert(*a);
+                    state
+                })
+            });
+            let state = session.map_or(
+                "已发现 · 等待连接".to_owned(),
+                |(status, detail)| session_label(status, detail),
+            );
             let address = device
                 .addresses
                 .first()
@@ -67,18 +70,24 @@ impl Devices {
                 format!("{state} · {address}"),
             ));
         }
-        // A connected device can stop advertising. Keep its actual session visible,
-        // and label a config fallback separately from a discovered phone.
-        if !matched && let Some(target) = self.target {
-            rows.insert(
-                0,
-                (
-                    "手机 · 当前连接目标".into(),
-                    format!("{target_state} · {target}"),
-                ),
-            );
+        for (target, (status, detail)) in &self.sessions {
+            if !matched.contains(target) {
+                rows.push((
+                    "设备 · 当前连接目标".into(),
+                    format!("{} · {target}", session_label(status, detail)),
+                ));
+            }
         }
         rows
+    }
+}
+
+fn session_label(status: &str, detail: &str) -> String {
+    match status {
+        "已连接" => "已连接 · 认证通过".into(),
+        "连接中" | "认证中" => status.into(),
+        _ if !detail.is_empty() => format!("{status} · {detail}"),
+        _ => "未连接 · 自动重试".into(),
     }
 }
 
@@ -130,12 +139,12 @@ pub fn start(events: Sender<TrayEvent>, stop: Arc<AtomicBool>) -> mpsc::SyncSend
                 .map(|devices| {
                     devices
                         .iter()
-                        .filter(|d| d.device_type == 1)
                         .filter_map(|device| {
                             device
                                 .addresses
                                 .iter()
                                 .find(|a| a.is_ipv4())
+                                .or_else(|| device.addresses.first())
                                 .map(|endpoint| mi_clip::share_queue::ShareDevice {
                                     name: device.name.clone(),
                                     device_type: device.device_type,
@@ -159,10 +168,39 @@ pub fn start(events: Sender<TrayEvent>, stop: Arc<AtomicBool>) -> mpsc::SyncSend
 mod tests {
     use super::*;
     #[test]
+    fn tablet_and_phone_keep_independent_connection_states() {
+        let phone = "192.0.2.1:1234".parse().unwrap();
+        let tablet = "192.0.2.2:1234".parse().unwrap();
+        let mut devices = Devices::default();
+        for (name, device_type, address) in [("手机", 1, phone), ("测试 Redmi Pad Pro", 2, tablet)]
+        {
+            devices.entries.push(Device {
+                name: name.into(),
+                host: "test.local.".into(),
+                port: 1234,
+                device_type,
+                addresses: vec![address],
+            });
+            devices.sessions.insert(address, ("已连接", String::new()));
+        }
+        let rows = devices.rows("已连接");
+        assert!(rows.iter().all(|row| row.1.contains("认证通过")));
+        assert!(rows[1].0.ends_with("平板电脑"));
+        devices
+            .sessions
+            .insert(tablet, ("等待重连", "认证失败".into()));
+        let rows = devices.rows("已连接");
+        assert!(rows[0].1.contains("认证通过"));
+        assert!(rows[1].1.contains("认证失败"));
+        devices.entries.clear();
+        assert_eq!(devices.rows("已连接").len(), 2);
+    }
+
+    #[test]
     fn only_matching_endpoint_is_authenticated_and_session_survives_missing_advertisement() {
         let address: SocketAddr = "192.0.2.1:1234".parse().unwrap();
         let mut devices = Devices {
-            target: Some(address),
+            sessions: [(address, ("已连接", String::new()))].into(),
             ..Default::default()
         };
         assert!(devices.rows("已连接")[0].1.contains("认证通过"));
@@ -183,7 +221,10 @@ mod tests {
         let rows = devices.rows("已连接");
         assert_eq!(rows.len(), 2);
         assert!(rows[0].1.contains("认证通过"));
-        assert!(rows[1].1.contains("未连接"));
+        assert!(rows[1].1.contains("等待连接"));
+        devices
+            .sessions
+            .insert(address, ("等待重连", String::new()));
         assert!(devices.rows("等待重连")[0].1.contains("自动重试"));
     }
 }

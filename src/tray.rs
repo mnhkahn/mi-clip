@@ -4,7 +4,7 @@ use async_channel::Sender;
 use gpui_rhai::gpui::{
     App, AppContext, Bounds, WindowBounds, WindowHandle, WindowKind, WindowOptions, point, px,
 };
-use mi_clip::file_feedback::{Event as FileEvent, Feedback, Icon};
+use mi_clip::file_feedback::{Event as FileEvent, FeedbackGroup as Feedback, Icon};
 use objc2::rc::Retained;
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
@@ -24,12 +24,15 @@ pub(crate) enum TrayEvent {
     Close,
     Status(&'static str, String),
     File(FileEvent),
+    SessionFile(std::net::SocketAddr, FileEvent),
     AnimationTick,
     CheckUpdate,
     RefreshDevices,
+    Capture,
+    CaptureSettings,
     Discovering,
     Devices(Result<Vec<crate::devices::Device>, ()>),
-    Connecting(std::net::SocketAddr),
+    SessionStatus(std::net::SocketAddr, &'static str, String),
     Update(crate::update_ui::Notice),
 }
 struct ActionState {
@@ -516,12 +519,58 @@ pub fn install(
             "检查更新".to_owned()
         };
         while let Ok(event) = receiver.recv().await {
+            let (file_target, event) = if let TrayEvent::SessionFile(target, event) = event {
+                (Some(target), TrayEvent::File(event))
+            } else {
+                (None, event)
+            };
+            let event = if let TrayEvent::SessionStatus(endpoint, status, detail) = event {
+                devices.sessions.insert(endpoint, (status, detail));
+                if let Some(opened) = panel.as_ref() {
+                    let _ = cx.update(|cx| {
+                        opened.update(cx, |panel, _, cx| panel.set_devices(devices.clone(), cx))
+                    });
+                }
+                let connected = devices
+                    .sessions
+                    .values()
+                    .filter(|(state, _)| *state == "已连接")
+                    .count();
+                if connected > 0 {
+                    let detail = &devices.sessions[&endpoint].1;
+                    TrayEvent::Status(
+                        "已连接",
+                        if status == "已连接" && !detail.is_empty() {
+                            format!("{connected} 台设备已连接 · {detail}")
+                        } else {
+                            format!("{connected} 台设备已连接")
+                        },
+                    )
+                } else {
+                    let detail = devices.sessions.get(&endpoint).unwrap().1.clone();
+                    TrayEvent::Status(status, detail)
+                }
+            } else {
+                event
+            };
+
             let result = cx.update(|cx| -> anyhow::Result<()> {
                 let anchor = match event {
                     TrayEvent::Toggle(anchor) => anchor,
                     TrayEvent::Close => {
                         if let Some(opened) = panel.take() {
                             let _ = opened.update(cx, |_, window, _| window.remove_window());
+                        }
+                        return Ok(());
+                    }
+                    TrayEvent::Capture | TrayEvent::CaptureSettings => {
+                        if let Some(opened) = panel.take() {
+                            let _ = opened.update(cx, |_, window, _| window.remove_window());
+                        }
+                        if matches!(event, TrayEvent::Capture) {
+                            crate::capture::open();
+                        } else {
+                            crate::capture::settings();
                         }
                         return Ok(());
                     }
@@ -545,14 +594,6 @@ pub fn install(
                         if let Ok(entries) = result {
                             devices.entries = entries;
                         }
-                        if let Some(opened) = panel.as_ref() {
-                            let _ = opened
-                                .update(cx, |panel, _, cx| panel.set_devices(devices.clone(), cx));
-                        }
-                        return Ok(());
-                    }
-                    TrayEvent::Connecting(endpoint) => {
-                        devices.target = Some(endpoint);
                         if let Some(opened) = panel.as_ref() {
                             let _ = opened
                                 .update(cx, |panel, _, cx| panel.set_devices(devices.clone(), cx));
@@ -608,6 +649,7 @@ pub fn install(
                         }
                         return Ok(());
                     }
+                    TrayEvent::SessionStatus(..) | TrayEvent::SessionFile(..) => unreachable!(),
                     TrayEvent::Status(status, detail) => {
                         if std::env::var_os("MICLIP_DIAGNOSTICS").is_some() {
                             println!("Mi Clip state: {status}; {detail}");
@@ -631,7 +673,7 @@ pub fn install(
                         return Ok(());
                     }
                     TrayEvent::File(event) => {
-                        let changed = feedback.apply(event, clock.elapsed());
+                        let changed = feedback.apply_for(file_target, event, clock.elapsed());
                         if changed {
                             detail_text.clear();
                         }
