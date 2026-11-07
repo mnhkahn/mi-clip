@@ -369,13 +369,24 @@ private final class EditorController: NSObject, NSWindowDelegate {
         var controls: [NSView] = [button("选择", self, #selector(selectTool)), button("画框", self, #selector(rectTool)), button("文字", self, #selector(textTool)), redact, colors, widths, fonts, button("撤销", self, #selector(undo)), button("重做", self, #selector(redo)), button("−", self, #selector(zoomOut)), button("+", self, #selector(zoomIn))]
         if onScroll != nil { controls.append(button("滚动截图", self, #selector(scrollCapture))) }
         controls += [button("复制", self, #selector(copyImage)), button("保存", self, #selector(saveImage))]
-        let tools = NSStackView(views: controls)
+        // Keep annotation and output controls on separate rows. A single row
+        // depends on AppKit's platform-specific intrinsic control widths and
+        // can detach or clip buttons when the editor is narrowed.
+        let annotationTools = NSStackView(views: Array(controls.prefix(7)))
+        let outputTools = NSStackView(views: Array(controls.dropFirst(7)))
+        for row in [annotationTools, outputTools] {
+            row.spacing = 6; row.detachesHiddenViews = false
+            row.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        }
+        let tools = NSStackView(views: [annotationTools, outputTools])
+        tools.orientation = .vertical; tools.alignment = .leading
+        tools.detachesHiddenViews = false
         tools.spacing = 6; tools.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(tools)
         scroll.translatesAutoresizingMaskIntoConstraints = false; scroll.hasVerticalScroller = true; scroll.hasHorizontalScroller = true
         scroll.backgroundColor = NSColor(white: 0.10, alpha: 1)
         scroll.documentView = canvas; root.addSubview(scroll)
-        NSLayoutConstraint.activate([tools.topAnchor.constraint(equalTo: root.topAnchor, constant: 8), tools.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8), tools.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -8), tools.heightAnchor.constraint(equalToConstant: 34), scroll.topAnchor.constraint(equalTo: tools.bottomAnchor, constant: 8), scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor), scroll.bottomAnchor.constraint(equalTo: root.bottomAnchor)])
+        NSLayoutConstraint.activate([tools.topAnchor.constraint(equalTo: root.topAnchor, constant: 8), tools.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8), tools.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -8), scroll.topAnchor.constraint(equalTo: tools.bottomAnchor, constant: 8), scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor), scroll.bottomAnchor.constraint(equalTo: root.bottomAnchor)])
         canvas.owner = self
         canvas.setZoom(min(1, 900 / CGFloat(image.width)))
         window.center(); window.makeFirstResponder(canvas)
@@ -610,12 +621,22 @@ func captureRunUITests(image: CGImage, output: URL) throws {
     precondition(editor.canvas.frame.width == CGFloat(image.width)*2)
     editor.window.contentView!.layoutSubtreeIfNeeded()
     let toolbar = editor.window.contentView!.subviews.compactMap { $0 as? NSStackView }.first!
-    for width: CGFloat in [850, 960] {
+    for width: CGFloat in [850, 960, 1200, 850] {
         editor.window.setContentSize(CGSize(width: width, height: 700))
         editor.window.contentView!.layoutSubtreeIfNeeded()
-        for control in toolbar.arrangedSubviews {
-            precondition(control.frame.width > 0 && toolbar.bounds.contains(control.frame), "all editor controls must fit at the minimum window width")
+        let root = editor.window.contentView!
+        // Half a point allows AppKit's subpixel rounding at row boundaries.
+        let visibleBounds = root.bounds.insetBy(dx: -0.5, dy: -0.5)
+        var controlCount = 0
+        for row in toolbar.arrangedSubviews.compactMap({ $0 as? NSStackView }) {
+            for control in row.arrangedSubviews {
+                controlCount += 1
+                let rect = control.convert(control.bounds, to: root)
+                precondition(control.superview === row && !control.isHidden && control.frame.width >= control.fittingSize.width - 0.5 && control.frame.height > 0 && visibleBounds.contains(rect), "all editor controls must remain visible and fit at window width \(width): \(control), frame \(rect), content \(root.bounds)")
+            }
         }
+        precondition(controlCount == 14, "no editor tools may be detached when the window shrinks")
+        precondition(editor.scroll.frame.maxY <= toolbar.frame.minY + 0.5, "the toolbar must not overlap the image")
     }
     editor.window.displayIfNeeded()
     RunLoop.current.run(until: Date().addingTimeInterval(0.3))
