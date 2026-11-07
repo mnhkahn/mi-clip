@@ -23,8 +23,95 @@ private func paintControl(_ bounds: CGRect, title: String, pressed: Bool) {
 private final class CaptureButton: NSButton {
     override func draw(_ dirtyRect: NSRect) { paintControl(bounds, title: title, pressed: isHighlighted) }
 }
-private final class CapturePopup: NSPopUpButton {
-    override func draw(_ dirtyRect: NSRect) { paintControl(bounds, title: (titleOfSelectedItem ?? "") + " ▾", pressed: isHighlighted) }
+private final class CaptureIconButton: NSButton {
+    var tint: NSColor = .labelColor
+    override func draw(_ dirtyRect: NSRect) {
+        if isHighlighted || state == .on {
+            (state == .on ? NSColor.controlAccentColor.withAlphaComponent(0.25) : NSColor.labelColor.withAlphaComponent(0.12)).setFill()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 6, yRadius: 6).fill()
+        }
+        guard let image else { return }
+        let rect = CGRect(x: bounds.midX-image.size.width/2, y: bounds.midY-image.size.height/2,
+                          width: image.size.width, height: image.size.height)
+        let context = NSGraphicsContext.current?.cgContext
+        if image.isTemplate { context?.beginTransparencyLayer(auxiliaryInfo: nil) }
+        image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        if image.isTemplate {
+            tint.setFill()
+            rect.fill(using: .sourceAtop)
+            context?.endTransparencyLayer()
+        }
+    }
+}
+
+private final class CaptureStylePicker: NSObject {
+    let button = CaptureIconButton()
+    let popover = NSPopover()
+    private let images: [NSImage]
+    private let labels: [String]
+    private let name: String
+    private(set) var index: Int
+    var onChange: (() -> Void)?
+
+    init(_ name: String, labels: [String], index: Int = 0, draw: @escaping (Int, CGRect) -> Void) {
+        self.name = name
+        self.labels = labels
+        self.index = index
+        images = labels.indices.map { index in
+            NSImage(size: CGSize(width: 26, height: 24), flipped: false) { rect in
+                draw(index, rect)
+                return true
+            }
+        }
+        super.init()
+        button.isBordered = false
+        button.target = self; button.action = #selector(toggle)
+        button.widthAnchor.constraint(equalToConstant: 36).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        updateButton()
+        popover.behavior = .transient
+    }
+
+    private func updateButton() {
+        button.image = images[index]
+        let label = "\(name) · \(labels[index])"
+        button.toolTip = label
+        button.setAccessibilityLabel(label)
+        button.needsDisplay = true
+    }
+
+    @objc private func toggle() {
+        if popover.isShown { close(); return }
+        let options = labels.indices.map { index in
+            let option = CaptureIconButton(image: images[index], target: self, action: #selector(choose(_:)))
+            option.isBordered = false
+            option.tag = index
+            option.toolTip = labels[index]; option.setAccessibilityLabel(labels[index])
+            option.state = index == self.index ? .on : .off
+            option.widthAnchor.constraint(equalToConstant: 32).isActive = true
+            option.heightAnchor.constraint(equalToConstant: 30).isActive = true
+            return option
+        }
+        let row = NSStackView(views: options)
+        row.alignment = .centerY
+        row.spacing = 3
+        row.edgeInsets = NSEdgeInsets(top: 6, left: 8, bottom: 6, right: 8)
+        let controller = NSViewController()
+        row.frame.size = row.fittingSize
+        controller.view = row
+        popover.contentViewController = controller
+        popover.contentSize = row.frame.size
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .maxY)
+    }
+
+    @objc private func choose(_ sender: NSButton) {
+        close()
+        index = sender.tag
+        updateButton()
+        onChange?()
+    }
+
+    func close() { popover.close() }
 }
 private func button(_ title: String, _ target: AnyObject, _ action: Selector) -> NSButton {
     let result = CaptureButton(title: title, target: target, action: action)
@@ -316,6 +403,7 @@ private final class CaptureController: NSObject, NSWindowDelegate {
         let app = previousApp
         previousApp = nil
         generation += 1; timer?.invalidate(); timer = nil; sampling = false
+        editor?.removeInlineControls()
         overlays.forEach { $0.close() }; overlays.removeAll(); toolbar?.close(); toolbar = nil
         if let editor, !editor.isInline { editor.window.close() }; editor = nil; selectedView = nil; assembler = nil; stableFrame = nil; scrollMarks = []; busy = false
         if restoreFocus { app?.activate(options: .activateIgnoringOtherApps) }
@@ -388,6 +476,7 @@ private final class SelectionView: NSView {
     let image: CGImage
     let outline = SelectionOutline()
     weak var owner: CaptureController?
+    weak var inlineToolbar: NSView?
     var selection = CGRect.zero
     private var start = CGPoint.zero
     private var original = CGRect.zero
@@ -404,7 +493,22 @@ private final class SelectionView: NSView {
         addSubview(outline)
     }
     required init?(coder: NSCoder) { fatalError() }
-    override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
+    override func resetCursorRects() {
+        guard let toolbar = inlineToolbar, !toolbar.isHidden, toolbar.superview === self else {
+            addCursorRect(bounds, cursor: .crosshair)
+            return
+        }
+        let bar = toolbar.frame.intersection(bounds)
+        guard !bar.isEmpty else { addCursorRect(bounds, cursor: .crosshair); return }
+        // Keep the crosshair out of the toolbar, including gaps between buttons.
+        for rect in [
+            CGRect(x: bounds.minX, y: bounds.minY, width: bounds.width, height: bar.minY-bounds.minY),
+            CGRect(x: bounds.minX, y: bar.maxY, width: bounds.width, height: bounds.maxY-bar.maxY),
+            CGRect(x: bounds.minX, y: bar.minY, width: bar.minX-bounds.minX, height: bar.height),
+            CGRect(x: bar.maxX, y: bar.minY, width: bounds.maxX-bar.maxX, height: bar.height)
+        ] where !rect.isEmpty { addCursorRect(rect, cursor: .crosshair) }
+        addCursorRect(bar, cursor: .arrow)
+    }
     override func draw(_ dirtyRect: NSRect) {
         NSImage(cgImage: image, size: bounds.size).draw(in: bounds, from: .zero, operation: .copy, fraction: 1, respectFlipped: true, hints: nil)
         NSColor.black.withAlphaComponent(0.42).setFill()
@@ -528,9 +632,29 @@ private final class EditorController: NSObject, NSWindowDelegate {
     let scroll = NSScrollView()
     let onClose: () -> Void
     let onScroll: (() -> Void)?
-    let colors = CapturePopup()
-    let widths = CapturePopup()
-    let fonts = CapturePopup()
+    private static let palette: [NSColor] = [.systemRed, .systemYellow, .systemBlue, .black, .white]
+    private static let strokes: [CGFloat] = [1, 3, 6]
+    private static let fontSizes: [CGFloat] = [16, 24, 36, 48, 72]
+    let colors = CaptureStylePicker("颜色", labels: ["红色", "黄色", "蓝色", "黑色", "白色"]) { index, rect in
+        let swatch = NSBezierPath(ovalIn: rect.insetBy(dx: 4.5, dy: 3.5))
+        EditorController.palette[index].setFill(); swatch.fill()
+        NSColor.labelColor.withAlphaComponent(0.4).setStroke(); swatch.stroke()
+    }
+    let widths = CaptureStylePicker("线宽", labels: ["细框", "中框", "粗框"], index: 1) { index, rect in
+        NSColor.labelColor.setFill()
+        let width = EditorController.strokes[index]
+        NSBezierPath(roundedRect: CGRect(x: rect.minX+2, y: rect.midY-width/2, width: rect.width-4, height: width),
+                     xRadius: width/2, yRadius: width/2).fill()
+    }
+    let fonts = CaptureStylePicker("字号", labels: EditorController.fontSizes.map { String(Int($0)) }, index: 1) { index, rect in
+        let title = "A" as NSString
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: [11, 13, 16, 19, 22][index], weight: .medium),
+            .foregroundColor: NSColor.labelColor
+        ]
+        let size = title.size(withAttributes: attributes)
+        title.draw(at: CGPoint(x: rect.midX-size.width/2, y: rect.midY-size.height/2), withAttributes: attributes)
+    }
     let isInline: Bool
     static let inlineBarHeight: CGFloat = 36
     private var inlineTools: NSVisualEffectView?
@@ -542,10 +666,7 @@ private final class EditorController: NSObject, NSWindowDelegate {
         window = overlay?.window ?? CapturePanel(contentRect: CGRect(x: 0, y: 0, width: 960, height: 700), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         super.init()
         canvas.owner = self
-        colors.addItems(withTitles: ["红色", "黄色", "蓝色", "黑色", "白色"])
-        widths.addItems(withTitles: ["细框", "中框", "粗框"]); widths.selectItem(at: 1)
-        fonts.addItems(withTitles: ["16", "24", "36", "48", "72"]); fonts.selectItem(at: 1)
-        for control in [colors, widths, fonts] { control.target = self; control.action = #selector(styleChanged) }
+        for picker in [colors, widths, fonts] { picker.onChange = { [weak self] in self?.styleChanged() } }
         if let overlay {
             installInlineControls(in: overlay)
             return
@@ -556,7 +677,7 @@ private final class EditorController: NSObject, NSWindowDelegate {
         let root = window.contentView!
         let redact = button("打码", self, #selector(redactTool))
         redact.toolTip = "拖动框选，用不透明黑色遮挡内容"
-        var controls: [NSView] = [button("选择", self, #selector(selectTool)), button("画框", self, #selector(rectTool)), button("文字", self, #selector(textTool)), redact, colors, widths, fonts, button("撤销", self, #selector(undo)), button("重做", self, #selector(redo)), button("−", self, #selector(zoomOut)), button("+", self, #selector(zoomIn))]
+        var controls: [NSView] = [button("选择", self, #selector(selectTool)), button("画框", self, #selector(rectTool)), button("文字", self, #selector(textTool)), redact, colors.button, widths.button, fonts.button, button("撤销", self, #selector(undo)), button("重做", self, #selector(redo)), button("−", self, #selector(zoomOut)), button("+", self, #selector(zoomIn))]
         if onScroll != nil { controls.append(button("滚动截图", self, #selector(scrollCapture))) }
         controls += [button("复制", self, #selector(copyImage)), button("保存", self, #selector(saveImage))]
         // Keep annotation and output controls on separate rows. A single row
@@ -585,30 +706,27 @@ private final class EditorController: NSObject, NSWindowDelegate {
         bar.material = .popover; bar.blendingMode = .withinWindow; bar.state = .active
         bar.wantsLayer = true; bar.layer?.cornerRadius = 8; bar.layer?.masksToBounds = true
         func icon(_ symbol: String, _ title: String, _ action: Selector, tool: EditorCanvas.Tool? = nil, tint: NSColor? = nil) -> NSButton {
-            let control = NSButton(title: title, target: self, action: action)
-            if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: title) {
-                control.image = image; control.imagePosition = .imageOnly
-            }
+            let control = CaptureIconButton(title: title, target: self, action: action)
+            control.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?
+                .withSymbolConfiguration(.init(pointSize: 15, weight: .medium))
+            control.imagePosition = .imageOnly
             control.toolTip = title; control.setAccessibilityLabel(title)
-            control.contentTintColor = tint
-            control.bezelStyle = .recessed; control.isBordered = false
+            control.tint = tint ?? .labelColor
+            control.isBordered = false
             if let tool {
-                control.setButtonType(.toggle); control.isBordered = true
+                control.setButtonType(.toggle)
                 toolButtons[tool] = control
             }
             control.widthAnchor.constraint(equalToConstant: 31).isActive = true
+            control.heightAnchor.constraint(equalToConstant: 28).isActive = true
             return control
-        }
-        for (popup, label) in [(colors, "颜色"), (widths, "线宽"), (fonts, "字号")] {
-            popup.widthAnchor.constraint(equalToConstant: 48).isActive = true
-            popup.toolTip = label; popup.setAccessibilityLabel(label)
         }
         let tools = NSStackView(views: [
             icon("viewfinder", "移动选区或标注", #selector(selectTool), tool: .select),
             icon("rectangle", "画框", #selector(rectTool), tool: .rectangle),
             icon("textformat", "文字", #selector(textTool), tool: .text),
             icon("rectangle.fill", "打码", #selector(redactTool), tool: .redact),
-            colors, widths, fonts,
+            colors.button, widths.button, fonts.button,
             icon("arrow.uturn.backward", "撤销", #selector(undo)),
             icon("arrow.uturn.forward", "重做", #selector(redo)),
             icon("rectangle.portrait.on.rectangle.portrait", "滚动截图", #selector(scrollCapture)),
@@ -616,14 +734,17 @@ private final class EditorController: NSObject, NSWindowDelegate {
             icon("xmark", "取消", #selector(closeEditing), tint: .systemRed),
             icon("checkmark", "完成并复制", #selector(copyImage), tint: .systemGreen),
         ])
+        tools.alignment = .centerY
         tools.spacing = 2
         tools.edgeInsets = NSEdgeInsets(top: 3, left: 5, bottom: 3, right: 5)
         bar.addSubview(tools)
-        bar.frame.size = CGSize(width: tools.fittingSize.width, height: Self.inlineBarHeight)
-        tools.frame = bar.bounds; tools.autoresizingMask = [.width, .height]
+        let size = tools.fittingSize
+        bar.frame.size = CGSize(width: size.width, height: Self.inlineBarHeight)
+        tools.frame = CGRect(x: 0, y: (bar.bounds.height-size.height)/2, width: size.width, height: size.height)
         overlay.addSubview(canvas, positioned: .below, relativeTo: overlay.outline)
         overlay.addSubview(bar)
         inlineTools = bar
+        overlay.inlineToolbar = bar
         updateRegion(canvas.document.image, selection: overlay.selection, offset: .zero)
         selectTool()
     }
@@ -644,15 +765,25 @@ private final class EditorController: NSObject, NSWindowDelegate {
         setInlineVisible(true)
     }
     func setInlineVisible(_ visible: Bool) {
-        if !visible { canvas.finishText() }
+        if !visible {
+            canvas.finishText()
+            closeStylePickers()
+        }
         canvas.isHidden = !visible; inlineTools?.isHidden = !visible
+        if let overlay = canvas.superview { window.invalidateCursorRects(for: overlay) }
     }
     func removeInlineControls() {
         guard isInline else { return }
+        closeStylePickers()
         canvas.finishText()
+        let overlay = canvas.superview
         canvas.removeFromSuperview(); inlineTools?.removeFromSuperview()
+        if let overlay { window.invalidateCursorRects(for: overlay) }
     }
-    func windowWillClose(_ notification: Notification) { onClose() }
+    private func closeStylePickers() {
+        for picker in [colors, widths, fonts] { picker.close() }
+    }
+    func windowWillClose(_ notification: Notification) { closeStylePickers(); onClose() }
     @objc func closeEditing() { if isInline { onClose() } else { window.close() } }
     private func setTool(_ tool: EditorCanvas.Tool) {
         canvas.finishText(); canvas.tool = tool
@@ -664,11 +795,11 @@ private final class EditorController: NSObject, NSWindowDelegate {
     @objc func textTool() { setTool(.text) }
     @objc func redactTool() { setTool(.redact) }
     @objc func scrollCapture() { onScroll?() }
-    @objc func styleChanged() {
+    private func styleChanged() {
         canvas.finishText()
-        canvas.color = [NSColor.systemRed, .systemYellow, .systemBlue, .black, .white][colors.indexOfSelectedItem]
-        canvas.stroke = [CGFloat(1), 3, 6][widths.indexOfSelectedItem]
-        canvas.fontSize = CGFloat(Int(fonts.titleOfSelectedItem ?? "24") ?? 24)
+        canvas.color = Self.palette[colors.index]
+        canvas.stroke = Self.strokes[widths.index]
+        canvas.fontSize = Self.fontSizes[fonts.index]
         if let index = canvas.selected {
             canvas.document.checkpoint()
             canvas.document.marks[index].color = canvas.color
@@ -850,6 +981,7 @@ func captureRunUITests(image: CGImage, output: URL) throws {
     controller.busy = true
     let selection = SelectionView(screen: NSScreen.main!, image: image, owner: controller)
     let overlay = CapturePanel(contentRect: CGRect(x: 0, y: 0, width: 720, height: 540), styleMask: [.borderless], backing: .buffered, defer: false)
+    overlay.level = .screenSaver
     overlay.isReleasedWhenClosed = false; overlay.contentView = selection
     selection.frame.size = CGSize(width: 720, height: 540)
     controller.overlays = [overlay]
@@ -864,6 +996,10 @@ func captureRunUITests(image: CGImage, output: URL) throws {
     let inline = controller.editor!
     let inlineCanvas = inline.canvas
     let bar = selection.subviews.compactMap { $0 as? NSVisualEffectView }.first!
+    overlay.contentView!.layoutSubtreeIfNeeded()
+    let buttons = (bar.subviews.first as! NSStackView).arrangedSubviews
+    precondition(buttons.allSatisfy { abs($0.convert($0.bounds, to: bar).midY - bar.bounds.midY) <= 0.5 },
+                 "the tool buttons must share the toolbar's vertical center: \(buttons.map { $0.convert($0.bounds, to: bar).midY }) vs \(bar.bounds.midY)")
     precondition(inline.window === overlay && inlineCanvas.superview === selection,
                  "the editor must stay on the screenshot overlay")
     precondition(inlineCanvas.document.image.width == 140 && inlineCanvas.document.image.height == 100)
@@ -875,11 +1011,18 @@ func captureRunUITests(image: CGImage, output: URL) throws {
     dragSelection(from: movePoint, to: CGPoint(x: 265, y: 205))
     precondition(controller.editor === inline && selection.selection.origin == CGPoint(x: 135, y: 75))
     inline.rectTool()
+    inline.widths.popover.animates = false
+    inline.widths.button.performClick(nil)
+    precondition(inline.widths.popover.isShown, "stroke previews must open on the capture overlay")
+    let strokes = (inline.widths.popover.contentViewController!.view as! NSStackView).arrangedSubviews
+    (strokes[2] as! NSButton).performClick(nil)
+    precondition(!inline.widths.popover.isShown)
     let markStart = CGPoint(x: 60, y: 60), markEnd = CGPoint(x: 180, y: 120)
     inlineCanvas.mouseDown(with: mouse(.leftMouseDown, in: inlineCanvas, at: markStart))
     inlineCanvas.mouseDragged(with: mouse(.leftMouseDragged, in: inlineCanvas, at: markEnd))
     inlineCanvas.mouseUp(with: mouse(.leftMouseUp, in: inlineCanvas, at: markEnd))
     precondition(inlineCanvas.document.marks.first?.rect == CGRect(x: 20, y: 20, width: 40, height: 20))
+    precondition(inlineCanvas.document.marks.first?.lineWidth == 6, "the chosen stroke preview must apply to new marks")
     let leftHandle = CGPoint(x: selection.selection.minX, y: selection.selection.midY)
     precondition(selection.hitTest(selection.convert(leftHandle, to: selection.superview)) === selection, "resize handles must work even while drawing")
     dragSelection(from: leftHandle, to: CGPoint(x: leftHandle.x-30, y: leftHandle.y))
@@ -914,7 +1057,13 @@ func captureRunUITests(image: CGImage, output: URL) throws {
     precondition(canvas.document.marks.count == 1 && canvas.document.marks[0].kind == .redact)
     precondition(canvas.document.marks[0].rect == CGRect(x: 30, y: 30, width: 70, height: 60))
     // Changing the text/frame color must never make redaction transparent.
-    editor.colors.selectItem(at: 4); editor.styleChanged()
+    editor.colors.popover.animates = false
+    editor.colors.button.performClick(nil)
+    precondition(editor.colors.popover.isShown)
+    let swatches = (editor.colors.popover.contentViewController!.view as! NSStackView).arrangedSubviews
+    (swatches[4] as! NSButton).performClick(nil)
+    precondition(editor.colors.index == 4 && canvas.color == .white, "selecting a swatch must update the annotation color")
+    precondition(!editor.colors.popover.isShown, "selecting a swatch must close the palette")
     let redacted = PixelFrame(canvas.document.render().cgImage!)
     let original = PixelFrame(image)
     for y in 0..<image.height { for x in 0..<image.width {
