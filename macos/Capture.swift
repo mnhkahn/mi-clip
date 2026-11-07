@@ -109,7 +109,7 @@ private final class CaptureController: NSObject, NSWindowDelegate {
         }
     }
     func stop() {
-        cancel(); if let hotkey { UnregisterEventHotKey(hotkey); self.hotkey = nil }
+        cancel(restoreFocus: false); if let hotkey { UnregisterEventHotKey(hotkey); self.hotkey = nil }
         if let handler { RemoveEventHandler(handler); self.handler = nil }
         settingsWindow?.delegate = nil; settingsWindow?.close(); settingsWindow = nil
         permissionWindow?.close(); permissionWindow = nil
@@ -130,7 +130,7 @@ private final class CaptureController: NSObject, NSWindowDelegate {
         func next(_ index: Int) {
             guard token == self.generation else { return }
             if index == screens.count {
-                guard !images.isEmpty else { self.cancel(); self.showPermissionHelp(captureFailed: true); return }
+                guard !images.isEmpty else { self.cancel(restoreFocus: false); self.showPermissionHelp(captureFailed: true); return }
                 for (screen, image) in images {
                     let panel = CapturePanel(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
                     panel.level = .screenSaver; panel.isOpaque = true; panel.hasShadow = false
@@ -225,20 +225,25 @@ private final class CaptureController: NSObject, NSWindowDelegate {
             permissionStatus?.stringValue = "无法重新申请，请在授权设置中替换旧 Clip。"
         }
     }
-    func selected(_ view: SelectionView) {
+    func selected(_ view: SelectionView, replacing: Bool, resizeOffset: CGPoint) {
+        guard let image = view.cropped(), let window = view.window else { return }
+        if selectedView === view, let editor, !replacing {
+            editor.updateRegion(image, selection: view.selection, offset: resizeOffset)
+            return
+        }
+        editor?.removeInlineControls()
+        if selectedView !== view { selectedView?.clearSelection() }
         selectedView = view
-        editSelection()
+        editor = EditorController(image: image, overlay: view,
+                                  onScroll: { [weak self] in self?.startScroll() },
+                                  onClose: { [weak self] in self?.cancel() })
+        window.makeKeyAndOrderFront(nil)
     }
-    @objc func editSelection() {
-        guard let view = selectedView, let image = view.cropped() else { return }
-        showEditor(image, allowScroll: true)
-    }
-    func showEditor(_ image: CGImage, allowScroll: Bool = false, marks: [CaptureMark] = []) {
+    func showEditor(_ image: CGImage, marks: [CaptureMark] = []) {
         timer?.invalidate(); timer = nil; generation += 1
         overlays.forEach { $0.close() }; overlays.removeAll(); toolbar?.close(); toolbar = nil
-        assembler = nil; stableFrame = nil; scrollMarks = []
-        if !allowScroll { selectedView = nil }
-        editor = EditorController(image: image, onScroll: allowScroll ? { [weak self] in self?.startScroll() } : nil, onClose: { [weak self] in self?.editor = nil; self?.selectedView = nil; self?.busy = false })
+        assembler = nil; stableFrame = nil; scrollMarks = []; selectedView = nil
+        editor = EditorController(image: image, onClose: { [weak self] in self?.editor = nil; self?.busy = false })
         editor!.canvas.document.marks = marks
         editor!.window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
     }
@@ -248,7 +253,7 @@ private final class CaptureController: NSObject, NSWindowDelegate {
         editor?.canvas.finishText()
         scrollMarks = editor?.canvas.document.marks ?? []
         // Transition to scrolling without ending the current capture session.
-        editor?.window.delegate = nil; editor?.window.close(); editor = nil
+        editor?.removeInlineControls(); editor = nil
         assembler = ScrollAssembler(image); stableFrame = nil; sampling = false
         overlays.forEach { $0.orderOut(nil) }; toolbar?.close()
         let frame = view.screen.visibleFrame
@@ -307,10 +312,13 @@ private final class CaptureController: NSObject, NSWindowDelegate {
         }
     }
     @objc func cancelAction() { cancel() }
-    func cancel() {
+    func cancel(restoreFocus: Bool = true) {
+        let app = previousApp
+        previousApp = nil
         generation += 1; timer?.invalidate(); timer = nil; sampling = false
         overlays.forEach { $0.close() }; overlays.removeAll(); toolbar?.close(); toolbar = nil
-        editor?.window.close(); editor = nil; selectedView = nil; assembler = nil; stableFrame = nil; scrollMarks = []; busy = false
+        if let editor, !editor.isInline { editor.window.close() }; editor = nil; selectedView = nil; assembler = nil; stableFrame = nil; scrollMarks = []; busy = false
+        if restoreFocus { app?.activate(options: .activateIgnoringOtherApps) }
     }
     func settings() {
         if let settingsWindow { settingsWindow.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
@@ -367,58 +375,151 @@ private final class ShortcutRecorder: NSView {
     }
 }
 
+private final class SelectionOutline: NSView {
+    weak var selectionView: SelectionView?
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func draw(_ dirtyRect: NSRect) { selectionView?.drawOutline() }
+}
+
 private final class SelectionView: NSView {
+    private enum Drag { case new, move, resize(Int, Int) }
     let screen: NSScreen
     let image: CGImage
+    let outline = SelectionOutline()
     weak var owner: CaptureController?
     var selection = CGRect.zero
-    var start = CGPoint.zero
-    var original = CGRect.zero
-    var mode = 0 // 0 new, 1 move, 2 resize bottom-right
+    private var start = CGPoint.zero
+    private var original = CGRect.zero
+    private var drag = Drag.new
+    private var didDrag = false
+    private let handles = [(-1,-1), (0,-1), (1,-1), (-1,0), (1,0), (-1,1), (0,1), (1,1)]
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
     init(screen: NSScreen, image: CGImage, owner: CaptureController) {
         self.screen = screen; self.image = image; self.owner = owner
         super.init(frame: CGRect(origin: .zero, size: screen.frame.size))
+        outline.selectionView = self
+        outline.frame = bounds; outline.autoresizingMask = [.width, .height]
+        addSubview(outline)
     }
     required init?(coder: NSCoder) { fatalError() }
     override func resetCursorRects() { addCursorRect(bounds, cursor: .crosshair) }
     override func draw(_ dirtyRect: NSRect) {
         NSImage(cgImage: image, size: bounds.size).draw(in: bounds, from: .zero, operation: .copy, fraction: 1, respectFlipped: true, hints: nil)
         NSColor.black.withAlphaComponent(0.42).setFill()
-        let path = NSBezierPath(rect: bounds); if !selection.isEmpty { path.appendRect(selection) }; path.windingRule = .evenOdd; path.fill()
-        if !selection.isEmpty {
-            NSColor.systemBlue.setStroke(); let border = NSBezierPath(rect: selection); border.lineWidth = 2; border.stroke()
-            NSColor.white.setFill(); NSBezierPath(rect: CGRect(x: selection.maxX-4, y: selection.maxY-4, width: 8, height: 8)).fill()
+        let path = NSBezierPath(rect: bounds)
+        if !selection.isEmpty { path.appendRect(selection) }
+        path.windingRule = .evenOdd; path.fill()
+    }
+    private func handlePoint(_ x: Int, _ y: Int) -> CGPoint {
+        CGPoint(x: selection.midX + CGFloat(x) * selection.width/2,
+                y: selection.midY + CGFloat(y) * selection.height/2)
+    }
+    private func handle(at point: CGPoint) -> (Int, Int)? {
+        guard !selection.isEmpty else { return nil }
+        return handles.min(by: { lhs, rhs in
+            let a = handlePoint(lhs.0, lhs.1), b = handlePoint(rhs.0, rhs.1)
+            return hypot(a.x-point.x, a.y-point.y) < hypot(b.x-point.x, b.y-point.y)
+        }).flatMap { x, y in
+            let center = handlePoint(x, y)
+            return hypot(point.x-center.x, point.y-center.y) <= 7 ? (x, y) : nil
         }
-        let text = selection.isEmpty ? "拖动框选截图区域 · 松开直接编辑 · Esc 取消" : "\(Int(selection.width * screen.backingScaleFactor)) × \(Int(selection.height * screen.backingScaleFactor)) · 松开直接编辑"
-        (text as NSString).draw(at: CGPoint(x: 24, y: 24), withAttributes: [.font: NSFont.systemFont(ofSize: 16), .foregroundColor: NSColor.white])
+    }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let hit = super.hitTest(point)
+        let local = convert(point, from: superview)
+        // Keep the handles interactive even while an annotation tool is active.
+        if hit is EditorCanvas, handle(at: local) != nil { return self }
+        return hit
+    }
+    func drawOutline() {
+        if selection.isEmpty {
+            ("拖动框选截图区域 · Esc 取消" as NSString).draw(at: CGPoint(x: 24, y: 24), withAttributes: [.font: NSFont.systemFont(ofSize: 16), .foregroundColor: NSColor.white])
+            return
+        }
+        NSColor.systemBlue.setStroke()
+        let border = NSBezierPath(rect: selection); border.lineWidth = 1.5; border.stroke()
+        for (x, y) in handles {
+            let p = handlePoint(x, y)
+            let dot = NSBezierPath(ovalIn: CGRect(x: p.x-3, y: p.y-3, width: 6, height: 6))
+            NSColor.systemBlue.setFill(); dot.fill(); NSColor.white.setStroke(); dot.stroke()
+        }
+        let pixels = pixelRect()
+        let text = "\(Int(pixels.width)) × \(Int(pixels.height))" as NSString
+        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium), .foregroundColor: NSColor.black]
+        let width = text.size(withAttributes: attrs).width+14
+        let roomBelow = selection.maxY + EditorController.inlineBarHeight + 14 <= bounds.maxY
+        let labelY = selection.minY >= 28 && roomBelow ? selection.minY-28 : selection.minY+7
+        let label = CGRect(x: min(selection.minX, bounds.maxX-width), y: labelY, width: width, height: 21)
+        NSColor.white.setFill(); NSBezierPath(roundedRect: label, xRadius: 4, yRadius: 4).fill()
+        text.draw(at: CGPoint(x: label.minX+7, y: label.minY+3), withAttributes: attrs)
     }
     override func mouseDown(with event: NSEvent) {
-        window?.makeFirstResponder(self); start = convert(event.locationInWindow, from: nil); original = selection
-        mode = CGRect(x: selection.maxX-12, y: selection.maxY-12, width: 24, height: 24).contains(start) && !selection.isEmpty ? 2 : selection.contains(start) ? 1 : 0
-        owner?.toolbar?.orderOut(nil)
+        window?.makeFirstResponder(self)
+        start = convert(event.locationInWindow, from: nil); original = selection; didDrag = false
+        if let (x, y) = handle(at: start) { drag = .resize(x, y) }
+        else if selection.contains(start) { drag = .move }
+        else { drag = .new }
     }
     override func mouseDragged(with event: NSEvent) {
-        var point = convert(event.locationInWindow, from: nil); point.x = min(max(0, point.x), bounds.width); point.y = min(max(0, point.y), bounds.height)
-        if mode == 1 { selection = original.offsetBy(dx: min(max(point.x-start.x, -original.minX), bounds.width-original.maxX), dy: min(max(point.y-start.y, -original.minY), bounds.height-original.maxY)) }
-        else if mode == 2 { selection = CGRect(x: original.minX, y: original.minY, width: max(4, point.x-original.minX), height: max(4, point.y-original.minY)).intersection(bounds) }
-        else { selection = CGRect(x: min(point.x,start.x), y: min(point.y,start.y), width: abs(point.x-start.x), height: abs(point.y-start.y)) }
-        needsDisplay = true
+        let location = convert(event.locationInWindow, from: nil)
+        let point = CGPoint(x: min(max(0, location.x), bounds.width), y: min(max(0, location.y), bounds.height))
+        didDrag = true
+        owner?.editor?.setInlineVisible(false)
+        let dx = point.x-start.x, dy = point.y-start.y
+        switch drag {
+        case .move:
+            selection = original.offsetBy(dx: min(max(dx, -original.minX), bounds.width-original.maxX),
+                                          dy: min(max(dy, -original.minY), bounds.height-original.maxY))
+        case .resize(let x, let y):
+            let left = x < 0 ? max(0, min(original.minX+dx, original.maxX-4)) : original.minX
+            let right = x > 0 ? min(bounds.maxX, max(original.maxX+dx, original.minX+4)) : original.maxX
+            let top = y < 0 ? max(0, min(original.minY+dy, original.maxY-4)) : original.minY
+            let bottom = y > 0 ? min(bounds.maxY, max(original.maxY+dy, original.minY+4)) : original.maxY
+            selection = CGRect(x: left, y: top, width: right-left, height: bottom-top)
+        case .new:
+            selection = CGRect(x: min(point.x,start.x), y: min(point.y,start.y), width: abs(point.x-start.x), height: abs(point.y-start.y))
+        }
+        needsDisplay = true; outline.needsDisplay = true
     }
     override func mouseUp(with event: NSEvent) {
-        if selection.width >= 4 && selection.height >= 4 {
-            let scale = screen.backingScaleFactor
-            let pixelRect = CGRect(x: selection.minX*scale, y: selection.minY*scale, width: selection.width*scale, height: selection.height*scale).integral
-            selection = CGRect(x: pixelRect.minX/scale, y: pixelRect.minY/scale, width: pixelRect.width/scale, height: pixelRect.height/scale).intersection(bounds)
-            owner?.selected(self)
+        guard didDrag else { return }
+        guard selection.width >= 4 && selection.height >= 4 else {
+            selection = original; needsDisplay = true; outline.needsDisplay = true
+            owner?.editor?.setInlineVisible(true)
+            return
         }
-    }
-    override func keyDown(with event: NSEvent) { if event.keyCode == 53 { owner?.cancel() } else if event.keyCode == 36 { owner?.editSelection() } }
-    func cropped() -> CGImage? {
+        let pixels = pixelRect()
         let sx = CGFloat(image.width)/bounds.width, sy = CGFloat(image.height)/bounds.height
-        return image.cropping(to: CGRect(x: selection.minX*sx, y: selection.minY*sy, width: selection.width*sx, height: selection.height*sy).integral)
+        selection = CGRect(x: pixels.minX/sx, y: pixels.minY/sy, width: pixels.width/sx, height: pixels.height/sy)
+        var offset = CGPoint.zero
+        if case .resize = drag {
+            offset = CGPoint(x: (original.minX-selection.minX)*sx, y: (original.minY-selection.minY)*sy)
+        }
+        let replacing: Bool
+        if case .new = drag { replacing = true } else { replacing = false }
+        owner?.selected(self, replacing: replacing, resizeOffset: offset)
+        needsDisplay = true; outline.needsDisplay = true
     }
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 { owner?.cancel() }
+        else if event.keyCode == 36, owner?.selectedView === self { owner?.editor?.copyImage() }
+        else { super.keyDown(with: event) }
+    }
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard owner?.selectedView === self else { return false }
+        return owner?.editor?.canvas.performKeyEquivalent(with: event) ?? false
+    }
+    func clearSelection() {
+        selection = .zero; needsDisplay = true; outline.needsDisplay = true
+    }
+    private func pixelRect() -> CGRect {
+        let sx = CGFloat(image.width)/bounds.width, sy = CGFloat(image.height)/bounds.height
+        return CGRect(x: selection.minX*sx, y: selection.minY*sy, width: selection.width*sx, height: selection.height*sy).integral
+            .intersection(CGRect(x: 0, y: 0, width: image.width, height: image.height))
+    }
+    func cropped() -> CGImage? { image.cropping(to: pixelRect()) }
 }
 
 private final class EditorController: NSObject, NSWindowDelegate {
@@ -430,19 +531,29 @@ private final class EditorController: NSObject, NSWindowDelegate {
     let colors = CapturePopup()
     let widths = CapturePopup()
     let fonts = CapturePopup()
-    init(image: CGImage, onScroll: (() -> Void)? = nil, onClose: @escaping () -> Void) {
+    let isInline: Bool
+    static let inlineBarHeight: CGFloat = 36
+    private var inlineTools: NSVisualEffectView?
+    private var toolButtons: [EditorCanvas.Tool: NSButton] = [:]
+    init(image: CGImage, overlay: SelectionView? = nil, onScroll: (() -> Void)? = nil, onClose: @escaping () -> Void) {
         self.onClose = onClose; self.onScroll = onScroll
+        isInline = overlay != nil
         canvas = EditorCanvas(image: image)
-        window = CapturePanel(contentRect: CGRect(x: 0, y: 0, width: 960, height: 700), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        window = overlay?.window ?? CapturePanel(contentRect: CGRect(x: 0, y: 0, width: 960, height: 700), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         super.init()
-        window.title = "截图标注"; window.isReleasedWhenClosed = false; window.delegate = self
-        window.minSize = CGSize(width: 850, height: 400)
-        window.appearance = NSAppearance(named: .darkAqua)
-        let root = window.contentView!
+        canvas.owner = self
         colors.addItems(withTitles: ["红色", "黄色", "蓝色", "黑色", "白色"])
         widths.addItems(withTitles: ["细框", "中框", "粗框"]); widths.selectItem(at: 1)
         fonts.addItems(withTitles: ["16", "24", "36", "48", "72"]); fonts.selectItem(at: 1)
         for control in [colors, widths, fonts] { control.target = self; control.action = #selector(styleChanged) }
+        if let overlay {
+            installInlineControls(in: overlay)
+            return
+        }
+        window.title = "截图标注"; window.isReleasedWhenClosed = false; window.delegate = self
+        window.minSize = CGSize(width: 850, height: 400)
+        window.appearance = NSAppearance(named: .darkAqua)
+        let root = window.contentView!
         let redact = button("打码", self, #selector(redactTool))
         redact.toolTip = "拖动框选，用不透明黑色遮挡内容"
         var controls: [NSView] = [button("选择", self, #selector(selectTool)), button("画框", self, #selector(rectTool)), button("文字", self, #selector(textTool)), redact, colors, widths, fonts, button("撤销", self, #selector(undo)), button("重做", self, #selector(redo)), button("−", self, #selector(zoomOut)), button("+", self, #selector(zoomIn))]
@@ -466,15 +577,92 @@ private final class EditorController: NSObject, NSWindowDelegate {
         scroll.backgroundColor = NSColor(white: 0.10, alpha: 1)
         scroll.documentView = canvas; root.addSubview(scroll)
         NSLayoutConstraint.activate([tools.topAnchor.constraint(equalTo: root.topAnchor, constant: 8), tools.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8), tools.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -8), scroll.topAnchor.constraint(equalTo: tools.bottomAnchor, constant: 8), scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor), scroll.bottomAnchor.constraint(equalTo: root.bottomAnchor)])
-        canvas.owner = self
         canvas.setZoom(min(1, 900 / CGFloat(image.width)))
         window.center(); window.makeFirstResponder(canvas)
     }
+    private func installInlineControls(in overlay: SelectionView) {
+        let bar = NSVisualEffectView()
+        bar.material = .popover; bar.blendingMode = .withinWindow; bar.state = .active
+        bar.wantsLayer = true; bar.layer?.cornerRadius = 8; bar.layer?.masksToBounds = true
+        func icon(_ symbol: String, _ title: String, _ action: Selector, tool: EditorCanvas.Tool? = nil, tint: NSColor? = nil) -> NSButton {
+            let control = NSButton(title: title, target: self, action: action)
+            if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: title) {
+                control.image = image; control.imagePosition = .imageOnly
+            }
+            control.toolTip = title; control.setAccessibilityLabel(title)
+            control.contentTintColor = tint
+            control.bezelStyle = .recessed; control.isBordered = false
+            if let tool {
+                control.setButtonType(.toggle); control.isBordered = true
+                toolButtons[tool] = control
+            }
+            control.widthAnchor.constraint(equalToConstant: 31).isActive = true
+            return control
+        }
+        for (popup, label) in [(colors, "颜色"), (widths, "线宽"), (fonts, "字号")] {
+            popup.widthAnchor.constraint(equalToConstant: 48).isActive = true
+            popup.toolTip = label; popup.setAccessibilityLabel(label)
+        }
+        let tools = NSStackView(views: [
+            icon("viewfinder", "移动选区或标注", #selector(selectTool), tool: .select),
+            icon("rectangle", "画框", #selector(rectTool), tool: .rectangle),
+            icon("textformat", "文字", #selector(textTool), tool: .text),
+            icon("rectangle.fill", "打码", #selector(redactTool), tool: .redact),
+            colors, widths, fonts,
+            icon("arrow.uturn.backward", "撤销", #selector(undo)),
+            icon("arrow.uturn.forward", "重做", #selector(redo)),
+            icon("rectangle.portrait.on.rectangle.portrait", "滚动截图", #selector(scrollCapture)),
+            icon("arrow.down.to.line", "保存", #selector(saveImage)),
+            icon("xmark", "取消", #selector(closeEditing), tint: .systemRed),
+            icon("checkmark", "完成并复制", #selector(copyImage), tint: .systemGreen),
+        ])
+        tools.spacing = 2
+        tools.edgeInsets = NSEdgeInsets(top: 3, left: 5, bottom: 3, right: 5)
+        bar.addSubview(tools)
+        bar.frame.size = CGSize(width: tools.fittingSize.width, height: Self.inlineBarHeight)
+        tools.frame = bar.bounds; tools.autoresizingMask = [.width, .height]
+        overlay.addSubview(canvas, positioned: .below, relativeTo: overlay.outline)
+        overlay.addSubview(bar)
+        inlineTools = bar
+        updateRegion(canvas.document.image, selection: overlay.selection, offset: .zero)
+        selectTool()
+    }
+    func updateRegion(_ image: CGImage, selection: CGRect, offset: CGPoint) {
+        canvas.finishText()
+        canvas.document.replaceImage(image, offset: offset)
+        canvas.zoom = selection.width / CGFloat(image.width)
+        canvas.frame = selection; canvas.needsDisplay = true
+        if let bar = inlineTools, let bounds = canvas.superview?.bounds {
+            let gap: CGFloat = 7
+            let x = max(bounds.minX+gap, min(selection.maxX-bar.frame.width, bounds.maxX-bar.frame.width-gap))
+            let below = selection.maxY+gap
+            let above = selection.minY-bar.frame.height-gap
+            let y = below+bar.frame.height <= bounds.maxY-gap ? below
+                : max(bounds.minY+gap, above)
+            bar.setFrameOrigin(CGPoint(x: x, y: y))
+        }
+        setInlineVisible(true)
+    }
+    func setInlineVisible(_ visible: Bool) {
+        if !visible { canvas.finishText() }
+        canvas.isHidden = !visible; inlineTools?.isHidden = !visible
+    }
+    func removeInlineControls() {
+        guard isInline else { return }
+        canvas.finishText()
+        canvas.removeFromSuperview(); inlineTools?.removeFromSuperview()
+    }
     func windowWillClose(_ notification: Notification) { onClose() }
-    @objc func selectTool() { canvas.finishText(); canvas.tool = .select; window.makeFirstResponder(canvas) }
-    @objc func rectTool() { canvas.finishText(); canvas.tool = .rectangle; window.makeFirstResponder(canvas) }
-    @objc func textTool() { canvas.finishText(); canvas.tool = .text; window.makeFirstResponder(canvas) }
-    @objc func redactTool() { canvas.finishText(); canvas.tool = .redact; window.makeFirstResponder(canvas) }
+    @objc func closeEditing() { if isInline { onClose() } else { window.close() } }
+    private func setTool(_ tool: EditorCanvas.Tool) {
+        canvas.finishText(); canvas.tool = tool
+        for (kind, control) in toolButtons { control.state = kind == tool ? .on : .off }
+        window.makeFirstResponder(canvas)
+    }
+    @objc func selectTool() { setTool(.select) }
+    @objc func rectTool() { setTool(.rectangle) }
+    @objc func textTool() { setTool(.text) }
+    @objc func redactTool() { setTool(.redact) }
     @objc func scrollCapture() { onScroll?() }
     @objc func styleChanged() {
         canvas.finishText()
@@ -512,7 +700,9 @@ private final class EditorController: NSObject, NSWindowDelegate {
         guard data.count <= 32 * 1024 * 1024 else { notify("图片过大，请保存原图"); return }
         let item = NSPasteboardItem(); item.setData(data, forType: .png)
         NSPasteboard.general.clearContents()
-        if NSPasteboard.general.writeObjects([item]) { window.title = "截图已复制 · 可在已连接设备取用" } else { notify("写入剪贴板失败") }
+        if NSPasteboard.general.writeObjects([item]) {
+            if isInline { onClose() } else { window.title = "截图已复制 · 可在已连接设备取用" }
+        } else { notify("写入剪贴板失败") }
     }
     @objc func saveImage() {
         canvas.finishText()
@@ -521,7 +711,8 @@ private final class EditorController: NSObject, NSWindowDelegate {
             guard response == .OK, let url = panel.url else { return }
             do {
                 guard let data = self.canvas.document.render().representation(using: .png, properties: [:]) else { throw NSError(domain: "Capture", code: 1) }
-                try data.write(to: url, options: .atomic); self.window.title = "截图已保存"
+                try data.write(to: url, options: .atomic)
+                if self.isInline { self.onClose() } else { self.window.title = "截图已保存" }
             } catch { notify("保存失败：\(error.localizedDescription)") }
         }
     }
@@ -565,10 +756,22 @@ private final class EditorCanvas: NSView {
         }
         context.restoreGState()
     }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let hit = super.hitTest(point)
+        if hit === self, owner?.isInline == true, tool == .select {
+            let local = convert(point, from: superview)
+            let pixel = CGPoint(x: local.x/zoom, y: local.y/zoom)
+            if mark(at: pixel) == nil { return nil }
+        }
+        return hit
+    }
+    private func mark(at point: CGPoint) -> Int? {
+        document.marks.indices.reversed().first { document.marks[$0].rect.insetBy(dx: -8/zoom, dy: -8/zoom).contains(point) }
+    }
     override func mouseDown(with event: NSEvent) {
         finishText(); window?.makeFirstResponder(self); start = location(event); dragging = false
         if tool == .select {
-            selected = document.marks.indices.reversed().first { document.marks[$0].rect.insetBy(dx: -8/zoom, dy: -8/zoom).contains(start) }
+            selected = mark(at: start)
             if let selected {
                 if event.clickCount == 2 && document.marks[selected].kind == .text { editText(selected); return }
                 original = document.marks[selected].rect
@@ -619,7 +822,9 @@ private final class EditorCanvas: NSView {
         needsDisplay = true
     }
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        guard window?.firstResponder === self, event.modifierFlags.contains(.command) else { return false }
+        guard event.modifierFlags.contains(.command),
+              window?.firstResponder === self ||
+              (owner?.isInline == true && window?.firstResponder is SelectionView) else { return false }
         switch event.charactersIgnoringModifiers?.lowercased() {
         case "c": owner?.copyImage()
         case "s": owner?.saveImage()
@@ -630,7 +835,9 @@ private final class EditorCanvas: NSView {
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 51 || event.keyCode == 117 {
             if let selected { document.checkpoint(); document.marks.remove(at: selected); self.selected = nil; needsDisplay = true }
-        } else if event.keyCode == 53 { window?.close() }
+        } else if event.keyCode == 53 { owner?.closeEditing() }
+        else if event.keyCode == 36, owner?.isInline == true { owner?.copyImage() }
+        else { super.keyDown(with: event) }
     }
 }
 
@@ -642,21 +849,57 @@ func captureRunUITests(image: CGImage, output: URL) throws {
     let controller = CaptureController()
     controller.busy = true
     let selection = SelectionView(screen: NSScreen.main!, image: image, owner: controller)
-    let overlay = CapturePanel(contentRect: CGRect(x: 0, y: 0, width: image.width, height: image.height), styleMask: [.borderless], backing: .buffered, defer: false)
+    let overlay = CapturePanel(contentRect: CGRect(x: 0, y: 0, width: 720, height: 540), styleMask: [.borderless], backing: .buffered, defer: false)
     overlay.isReleasedWhenClosed = false; overlay.contentView = selection
-    selection.frame.size = CGSize(width: image.width, height: image.height)
+    selection.frame.size = CGSize(width: 720, height: 540)
     controller.overlays = [overlay]
-    selection.mouseDown(with: mouse(.leftMouseDown, in: selection, at: CGPoint(x: 20, y: 20)))
-    selection.mouseUp(with: mouse(.leftMouseUp, in: selection, at: CGPoint(x: 20, y: 20)))
+    func dragSelection(from start: CGPoint, to end: CGPoint) {
+        selection.mouseDown(with: mouse(.leftMouseDown, in: selection, at: start))
+        if start != end { selection.mouseDragged(with: mouse(.leftMouseDragged, in: selection, at: end)) }
+        selection.mouseUp(with: mouse(.leftMouseUp, in: selection, at: end))
+    }
+    dragSelection(from: CGPoint(x: 60, y: 60), to: CGPoint(x: 60, y: 60))
     precondition(controller.editor == nil, "an empty click must not capture")
-    selection.mouseDown(with: mouse(.leftMouseDown, in: selection, at: CGPoint(x: 20, y: 20)))
-    selection.mouseDragged(with: mouse(.leftMouseDragged, in: selection, at: CGPoint(x: 220, y: 140)))
-    selection.mouseUp(with: mouse(.leftMouseUp, in: selection, at: CGPoint(x: 220, y: 140)))
-    precondition(controller.editor?.canvas.document.image.width == 200 && controller.editor?.canvas.document.image.height == 120, "mouse release must immediately show the cropped editor")
-    precondition(controller.overlays.isEmpty && controller.toolbar == nil && controller.busy)
-    precondition(controller.editor?.onScroll != nil && controller.selectedView === selection, "scroll capture must remain available")
-    controller.editor?.window.close()
-    precondition(!controller.busy && controller.editor == nil && controller.selectedView == nil)
+    dragSelection(from: CGPoint(x: 120, y: 60), to: CGPoint(x: 540, y: 360))
+    let inline = controller.editor!
+    let inlineCanvas = inline.canvas
+    let bar = selection.subviews.compactMap { $0 as? NSVisualEffectView }.first!
+    precondition(inline.window === overlay && inlineCanvas.superview === selection,
+                 "the editor must stay on the screenshot overlay")
+    precondition(inlineCanvas.document.image.width == 140 && inlineCanvas.document.image.height == 100)
+    precondition(controller.overlays.count == 1 && controller.busy)
+    precondition(inline.onScroll != nil && controller.selectedView === selection)
+    precondition(selection.bounds.contains(bar.frame) && bar.frame.minY > selection.selection.maxY)
+    let movePoint = CGPoint(x: 250, y: 190)
+    precondition(selection.hitTest(selection.convert(movePoint, to: selection.superview)) === selection, "unmarked pixels must let the user move the selection")
+    dragSelection(from: movePoint, to: CGPoint(x: 265, y: 205))
+    precondition(controller.editor === inline && selection.selection.origin == CGPoint(x: 135, y: 75))
+    inline.rectTool()
+    let markStart = CGPoint(x: 60, y: 60), markEnd = CGPoint(x: 180, y: 120)
+    inlineCanvas.mouseDown(with: mouse(.leftMouseDown, in: inlineCanvas, at: markStart))
+    inlineCanvas.mouseDragged(with: mouse(.leftMouseDragged, in: inlineCanvas, at: markEnd))
+    inlineCanvas.mouseUp(with: mouse(.leftMouseUp, in: inlineCanvas, at: markEnd))
+    precondition(inlineCanvas.document.marks.first?.rect == CGRect(x: 20, y: 20, width: 40, height: 20))
+    let leftHandle = CGPoint(x: selection.selection.minX, y: selection.selection.midY)
+    precondition(selection.hitTest(selection.convert(leftHandle, to: selection.superview)) === selection, "resize handles must work even while drawing")
+    dragSelection(from: leftHandle, to: CGPoint(x: leftHandle.x-30, y: leftHandle.y))
+    precondition(inlineCanvas.document.image.width == 150)
+    precondition(inlineCanvas.document.marks.first?.rect.origin == CGPoint(x: 30, y: 20),
+                 "resizing must keep existing marks over the same screen pixels")
+    inline.undo(); precondition(inlineCanvas.document.marks.isEmpty)
+    inline.redo(); precondition(inlineCanvas.document.marks.first?.rect.minX == 30)
+    overlay.displayIfNeeded()
+    if let preview = selection.bitmapImageRepForCachingDisplay(in: selection.bounds) {
+        selection.cacheDisplay(in: selection.bounds, to: preview)
+        try preview.representation(using: .png, properties: [:])?.write(
+            to: output.deletingLastPathComponent().appendingPathComponent("inline-capture.png"))
+    }
+    inline.selectTool()
+    dragSelection(from: CGPoint(x: 240, y: 240), to: CGPoint(x: 240, y: 390))
+    precondition(selection.bounds.contains(bar.frame) && bar.frame.maxY < selection.selection.minY,
+                 "the toolbar must move above a selection near the bottom edge")
+    inline.closeEditing()
+    precondition(!controller.busy && controller.editor == nil && controller.selectedView == nil && controller.overlays.isEmpty)
 
     var scrollRequested = false
     let editor = EditorController(image: image, onScroll: { scrollRequested = true }, onClose: {})
@@ -733,6 +976,6 @@ func captureRunUITests(image: CGImage, output: URL) throws {
         defer { if let first { UnregisterEventHotKey(first) }; if let second { UnregisterEventHotKey(second) } }
         precondition(RegisterEventHotKey(UInt32(kVK_F19), mods, EventHotKeyID(signature: 0x54455354, id: 101), GetApplicationEventTarget(), 0, &second) != noErr)
     }
-    print("PASS: immediate editor on selection release, empty selection, close cleanup, scroll entry, opaque redaction pixels and undo/redo, native editor layout, Chinese multiline text commit, zoom and non-stealing hotkey registration")
+    print("PASS: inline toolbar, movable selection, resize with annotations and undo, close cleanup, scroll entry, opaque redaction pixels and undo/redo, native editor layout, Chinese multiline text commit, zoom and non-stealing hotkey registration")
 }
 #endif

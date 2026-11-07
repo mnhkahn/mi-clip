@@ -3866,6 +3866,7 @@ dependencies = [
  "png 0.17.16",
  "posthog-rs",
  "qrcode",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "sha1",

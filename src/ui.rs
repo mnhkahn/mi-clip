@@ -73,7 +73,7 @@ pub struct Panel {
     host: ScriptViewHost,
     view: Result<ScriptViewHandle, String>,
     _blur: Subscription,
-    _outside_click: OutsideClickMonitor,
+    outside_click: Option<OutsideClickMonitor>,
     events: async_channel::Sender<crate::tray::TrayEvent>,
     pub(crate) update_label: String,
     content_height: f32,
@@ -81,6 +81,17 @@ pub struct Panel {
     status: String,
 }
 impl Panel {
+    pub(crate) fn is_shown(&self) -> bool {
+        self.outside_click.is_some()
+    }
+    pub(crate) fn start_monitoring(&mut self) {
+        if self.outside_click.is_none() {
+            self.outside_click = Some(OutsideClickMonitor::new(self.events.clone()));
+        }
+    }
+    pub(crate) fn stop_monitoring(&mut self) {
+        self.outside_click = None;
+    }
     pub(crate) fn device_count(&self) -> usize {
         self.devices.entries.len()
     }
@@ -122,7 +133,9 @@ impl Panel {
     }
     pub fn validate(&self, cx: &gpui_rhai::gpui::App) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self._outside_click.0.is_some(),
+            self.outside_click
+                .as_ref()
+                .is_some_and(|monitor| monitor.0.is_some()),
             "Outside click monitor unavailable"
         );
         let view = self
@@ -159,17 +172,16 @@ impl Panel {
         if let Ok(view) = &view {
             let _ = view.focus(window, cx);
         }
-        let outside_click = OutsideClickMonitor::new(events.clone());
-        let blur = cx.observe_window_activation(window, |_, window, _| {
-            if !window.is_window_active() {
-                window.remove_window();
+        let blur = cx.observe_window_activation(window, |panel, window, _| {
+            if panel.is_shown() && !window.is_window_active() {
+                let _ = panel.events.try_send(crate::tray::TrayEvent::Close);
             }
         });
         Self {
             host,
             view,
             _blur: blur,
-            _outside_click: outside_click,
+            outside_click: None,
             events,
             update_label,
             content_height: content_height(detail),
@@ -271,10 +283,18 @@ impl Render for Panel {
                 .bg(rgba(0x191b20ff))
                 .text_color(rgba(0xf0f2f5ff))
                 .text_size(px(12.0))
-                .on_action(|_: &crate::ClosePanel, window, _| window.remove_window())
-                .on_key_down(|event, window, _| {
-                    if event.keystroke.key == "escape" {
-                        window.remove_window();
+                .on_action({
+                    let events = self.events.clone();
+                    move |_: &crate::ClosePanel, _, _| {
+                        let _ = events.try_send(crate::tray::TrayEvent::Close);
+                    }
+                })
+                .on_key_down({
+                    let events = self.events.clone();
+                    move |event, _, _| {
+                        if event.keystroke.key == "escape" {
+                            let _ = events.try_send(crate::tray::TrayEvent::Close);
+                        }
                     }
                 })
                 // ScriptViewHandle's host has size_full(), so constrain it to

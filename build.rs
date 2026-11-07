@@ -2,6 +2,7 @@ use std::{env, path::PathBuf, process::Command};
 fn main() {
     println!("cargo:rerun-if-changed=macos/Capture.swift");
     println!("cargo:rerun-if-changed=macos/CaptureCore.swift");
+    println!("cargo:rerun-if-changed=macos/UpdateProxy.swift");
     if env::var_os("CARGO_FEATURE_UI").is_none() {
         return;
     }
@@ -26,6 +27,7 @@ fn main() {
             &format!("{arch}-apple-macosx12.0"),
             "macos/CaptureCore.swift",
             "macos/Capture.swift",
+            "macos/UpdateProxy.swift",
             "-o",
         ])
         .arg(output.join("libclip_capture.a"))
@@ -57,7 +59,13 @@ fn main() {
         String::from_utf8(sdk.stdout).unwrap().trim()
     );
     println!("cargo:rustc-link-lib=static=clip_capture");
-    for framework in ["Cocoa", "Carbon", "ScreenCaptureKit", "CoreGraphics"] {
+    for framework in [
+        "Cocoa",
+        "Carbon",
+        "ScreenCaptureKit",
+        "CoreGraphics",
+        "CFNetwork",
+    ] {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");

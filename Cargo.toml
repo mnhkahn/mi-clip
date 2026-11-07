@@ -7,7 +7,7 @@ publish = false
 
 [features]
 default = ["ui"]
-ui = ["dep:gpui-rhai", "dep:async-channel", "dep:block2", "clipboard", "file-sharing", "analytics"]
+ui = ["dep:gpui-rhai", "dep:async-channel", "dep:block2", "dep:raw-window-handle", "clipboard", "file-sharing", "analytics"]
 analytics = ["dep:posthog-rs", "dep:uuid"]
 clipboard = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-app-kit"]
 file-sharing = ["clipboard", "dep:kcp"]
@@ -39,6 +39,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 
 gpui-rhai = { version = "=0.2.2", default-features = false, optional = true }
 block2 = { version = "0.6.2", optional = true }
+raw-window-handle = { version = "0.6.2", optional = true }
 async-channel = { version = "2.5", optional = true }
 anyhow = "1"
 objc2 = { version = "0.6.4", optional = true }

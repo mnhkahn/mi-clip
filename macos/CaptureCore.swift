@@ -89,10 +89,25 @@ struct CaptureMark {
 }
 
 struct CaptureDocument {
-    let image: CGImage
+    private(set) var image: CGImage
     var marks: [CaptureMark] = []
     var undoStack: [[CaptureMark]] = []
     var redoStack: [[CaptureMark]] = []
+    init(image: CGImage) { self.image = image }
+    mutating func replaceImage(_ image: CGImage, offset: CGPoint) {
+        self.image = image
+        guard offset != .zero else { return }
+        func translated(_ marks: [CaptureMark]) -> [CaptureMark] {
+            marks.map { mark in
+                var moved = mark
+                moved.rect = mark.rect.offsetBy(dx: offset.x, dy: offset.y)
+                return moved
+            }
+        }
+        marks = translated(marks)
+        undoStack = undoStack.map(translated)
+        redoStack = redoStack.map(translated)
+    }
     mutating func checkpoint() { undoStack.append(marks); if undoStack.count > 100 { undoStack.removeFirst() }; redoStack.removeAll() }
     mutating func undo() { if let previous = undoStack.popLast() { redoStack.append(marks); marks = previous } }
     mutating func redo() { if let next = redoStack.popLast() { undoStack.append(marks); marks = next } }

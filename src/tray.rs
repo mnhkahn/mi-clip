@@ -2,16 +2,18 @@
 use crate::ui::{self, Panel};
 use async_channel::Sender;
 use gpui_rhai::gpui::{
-    App, AppContext, Bounds, WindowBounds, WindowHandle, WindowKind, WindowOptions, point, px,
+    App, AppContext, Bounds, Window, WindowBounds, WindowHandle, WindowKind, WindowOptions, point,
+    px,
 };
 use mi_clip::file_feedback::{Event as FileEvent, FeedbackGroup as Feedback, Icon};
 use objc2::rc::Retained;
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSImage, NSScreen, NSStatusBar,
-    NSStatusBarButton, NSStatusItem, NSWorkspace,
+    NSStatusBarButton, NSStatusItem, NSView, NSWindow, NSWorkspace,
 };
 use objc2_foundation::{MainThreadMarker, NSData, NSObject, NSObjectProtocol, NSSize, ns_string};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
@@ -19,6 +21,26 @@ pub(crate) struct Anchor {
     x: f32,
     y: f32,
 }
+fn native_popup(window: &Window) -> anyhow::Result<Retained<NSWindow>> {
+    let raw = HasWindowHandle::window_handle(window)
+        .map_err(|error| anyhow::anyhow!("Popup handle unavailable: {error}"))?;
+    let RawWindowHandle::AppKit(handle) = raw.as_raw() else {
+        anyhow::bail!("Expected an AppKit popup");
+    };
+    // SAFETY: GPUI provides a live NSView for the lifetime of the window borrow.
+    let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+    view.window()
+        .ok_or_else(|| anyhow::anyhow!("Popup has no AppKit window"))
+}
+
+fn hide_popup(panel: &mut Panel, window: &mut Window) -> anyhow::Result<()> {
+    // Keep GPUI's AccessKit adapter alive. Dropping it on close changes the
+    // responder's ObjC class while AppKit's Touch Bar still observes it.
+    panel.stop_monitoring();
+    native_popup(window)?.orderOut(None);
+    Ok(())
+}
+
 pub(crate) enum TrayEvent {
     Toggle(Anchor),
     Close,
@@ -230,12 +252,12 @@ pub fn install(
             }
             if quitting.get() {
                 passed.set(true);
-                println!("PASS: native file feedback frames, completion badge acknowledgement, update click feedback, toggle, Escape, outside-close event and Quit");
+                println!("PASS: native file feedback, update click, popup hide and reuse via toggle, Escape and outside click, and Quit");
             }
             std::future::ready(())
         }).detach();
         cx.spawn(async move |cx| {
-            use std::time::Duration;
+use std::time::Duration;
             let result = async {
                 cx.background_executor()
                     .timer(Duration::from_millis(250))
@@ -467,9 +489,19 @@ pub fn install(
                         .await;
                     cx.update(|cx| -> anyhow::Result<()> {
                         anyhow::ensure!(
-                            cx.windows().is_empty(),
-                            "Close path {step} left a popup open"
+                            cx.windows().len() == 1,
+                            "Close path {step} destroyed the reusable popup"
                         );
+                        let handle = cx.windows()[0]
+                            .downcast::<Panel>()
+                            .ok_or_else(|| anyhow::anyhow!("Wrong root"))?;
+                        handle.update(cx, |panel, window, _| -> anyhow::Result<()> {
+                            anyhow::ensure!(
+                                !panel.is_shown() && !native_popup(window)?.isVisible(),
+                                "Close path {step} left the popup or its click monitor open"
+                            );
+                            Ok(())
+                        })??;
                         if step == 2 {
                             quit_expected.set(true);
                         }
@@ -564,14 +596,14 @@ pub fn install(
                 let anchor = match event {
                     TrayEvent::Toggle(anchor) => anchor,
                     TrayEvent::Close => {
-                        if let Some(opened) = panel.take() {
-                            let _ = opened.update(cx, |_, window, _| window.remove_window());
+                        if let Some(opened) = panel.as_ref() {
+                            opened.update(cx, |panel, window, _| hide_popup(panel, window))??;
                         }
                         return Ok(());
                     }
                     TrayEvent::Capture | TrayEvent::CaptureSettings => {
-                        if let Some(opened) = panel.take() {
-                            let _ = opened.update(cx, |_, window, _| window.remove_window());
+                        if let Some(opened) = panel.as_ref() {
+                            opened.update(cx, |panel, window, _| hide_popup(panel, window))??;
                         }
                         if matches!(event, TrayEvent::Capture) {
                             crate::capture::open();
@@ -757,11 +789,16 @@ pub fn install(
                         return Ok(());
                     }
                 };
-                if let Some(existing) = panel.take() {
-                    if existing
-                        .update(cx, |_, window, _| window.remove_window())
-                        .is_ok()
-                    {
+                if let Some(existing) = panel.as_ref() {
+                    let hidden =
+                        existing.update(cx, |panel, window, _| -> anyhow::Result<bool> {
+                            if !panel.is_shown() {
+                                return Ok(false);
+                            }
+                            hide_popup(panel, window)?;
+                            Ok(true)
+                        })??;
+                    if hidden {
                         return Ok(());
                     }
                 }
@@ -769,41 +806,60 @@ pub fn install(
                     let _ = request.try_send(());
                 }
                 let detail = visible_detail(&feedback, &detail_text);
-                // Rhai compilation and native popup allocation happen only on demand.
-                let prepared = ui::prepare_status(status_text, &detail)?;
-                let opened = cx.open_window(
-                    WindowOptions {
-                        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                            point(px(anchor.x), px(anchor.y)),
-                            ui::panel_size(&detail),
-                        ))),
-                        titlebar: None,
-                        // A nonactivating AppKit panel accepts clicks while another
-                        // app remains active; a Floating window can lose the click
-                        // while macOS tries to activate this menu-bar-only app.
-                        kind: WindowKind::PopUp,
-                        is_resizable: false,
-                        is_minimizable: false,
-                        is_movable: false,
-                        ..Default::default()
-                    },
-                    |window, cx| {
-                        cx.new(|cx| {
-                            Panel::new(
-                                prepared,
-                                sender.clone(),
-                                update_text.clone(),
-                                status_text,
-                                &detail,
-                                window,
-                                cx,
-                            )
-                        })
-                    },
-                )?;
-                opened.update(cx, |panel, _, cx| panel.set_devices(devices.clone(), cx))?;
+                let opened = if let Some(existing) = panel {
+                    existing.update(cx, |panel, window, cx| -> anyhow::Result<()> {
+                        let native = native_popup(window)?;
+                        let main_height = NSScreen::screens(MainThreadMarker::new().unwrap())
+                            .firstObject()
+                            .map_or(0., |screen| screen.frame().size.height);
+                        native.setFrameTopLeftPoint(objc2_foundation::NSPoint::new(
+                            f64::from(anchor.x),
+                            main_height - f64::from(anchor.y),
+                        ));
+                        panel.refresh(status_text, &detail, window, cx)?;
+                        Ok(())
+                    })??;
+                    existing
+                } else {
+                    // Allocate the native popup on the first click and reuse it thereafter.
+                    let prepared = ui::prepare_status(status_text, &detail)?;
+                    cx.open_window(
+                        WindowOptions {
+                            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                point(px(anchor.x), px(anchor.y)),
+                                ui::panel_size(&detail),
+                            ))),
+                            titlebar: None,
+                            // A nonactivating AppKit panel accepts clicks while another
+                            // app remains active; a Floating window can lose the click
+                            // while macOS tries to activate this menu-bar-only app.
+                            kind: WindowKind::PopUp,
+                            is_resizable: false,
+                            is_minimizable: false,
+                            is_movable: false,
+                            ..Default::default()
+                        },
+                        |window, cx| {
+                            cx.new(|cx| {
+                                Panel::new(
+                                    prepared,
+                                    sender.clone(),
+                                    update_text.clone(),
+                                    status_text,
+                                    &detail,
+                                    window,
+                                    cx,
+                                )
+                            })
+                        },
+                    )?
+                };
                 panel = Some(opened);
-                opened.update(cx, |_, window, _| window.activate_window())?;
+                opened.update(cx, |panel, window, cx| {
+                    panel.set_devices(devices.clone(), cx);
+                    panel.start_monitoring();
+                    window.activate_window();
+                })?;
                 // Acknowledge only once the user can actually see the panel.
                 feedback.acknowledge();
                 render_feedback(

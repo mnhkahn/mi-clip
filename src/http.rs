@@ -5,6 +5,14 @@ use std::{
     sync::OnceLock,
 };
 const LIMIT: usize = 1_048_576;
+#[cfg(feature = "ui")]
+unsafe extern "C" {
+    fn clip_update_system_proxy(
+        target: *const c_char,
+        buffer: *mut c_char,
+        capacity: isize,
+    ) -> bool;
+}
 #[link(name = "curl")]
 unsafe extern "C" {
     fn curl_global_init(flags: c_long) -> c_int;
@@ -146,6 +154,15 @@ fn request_inner(
         "HTTPS initialization failed"
     );
     let target = CString::new(url)?;
+    #[cfg(feature = "ui")]
+    let mut proxy = [0 as c_char; 1024];
+    #[cfg(feature = "ui")]
+    let use_system_proxy = redirects
+        && !["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+        // SAFETY: Swift reads the NUL-terminated target and writes within the buffer.
+        && unsafe { clip_update_system_proxy(target.as_ptr(), proxy.as_mut_ptr(), proxy.len() as isize) };
     let mut capture = Capture {
         body: Vec::new(),
         headers: Vec::new(),
@@ -177,6 +194,10 @@ fn request_inner(
             };
         }
         set!(10002, target.as_ptr());
+        #[cfg(feature = "ui")]
+        if use_system_proxy {
+            set!(10004, proxy.as_ptr()); // CURLOPT_PROXY
+        }
         set!(
             20011,
             body_callback as extern "C" fn(*mut c_char, usize, usize, *mut c_void) -> usize
