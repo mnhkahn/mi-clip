@@ -525,7 +525,11 @@ pub fn install(
                 (None, event)
             };
             let event = if let TrayEvent::SessionStatus(endpoint, status, detail) = event {
-                devices.sessions.insert(endpoint, (status, detail));
+                if status == "未发现" {
+                    devices.sessions.remove(&endpoint);
+                } else {
+                    devices.sessions.insert(endpoint, (status, detail.clone()));
+                }
                 if let Some(opened) = panel.as_ref() {
                     let _ = cx.update(|cx| {
                         opened.update(cx, |panel, _, cx| panel.set_devices(devices.clone(), cx))
@@ -537,7 +541,6 @@ pub fn install(
                     .filter(|(state, _)| *state == "已连接")
                     .count();
                 if connected > 0 {
-                    let detail = &devices.sessions[&endpoint].1;
                     TrayEvent::Status(
                         "已连接",
                         if status == "已连接" && !detail.is_empty() {
@@ -547,8 +550,11 @@ pub fn install(
                         },
                     )
                 } else {
-                    let detail = devices.sessions.get(&endpoint).unwrap().1.clone();
-                    TrayEvent::Status(status, detail)
+                    if status == "未发现" {
+                        TrayEvent::Status("等待设备", "设备上线后将自动连接".into())
+                    } else {
+                        TrayEvent::Status(status, detail)
+                    }
                 }
             } else {
                 event

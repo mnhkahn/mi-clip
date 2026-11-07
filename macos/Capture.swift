@@ -71,6 +71,8 @@ private final class CaptureController: NSObject, NSWindowDelegate {
     var toolbar: NSPanel?
     var editor: EditorController?
     var settingsWindow: NSWindow?
+    var permissionWindow: NSWindow?
+    var permissionStatus: NSTextField?
     var recorder: ShortcutRecorder?
     var settingStatus: NSTextField?
     var enabled: NSButton?
@@ -110,14 +112,15 @@ private final class CaptureController: NSObject, NSWindowDelegate {
         cancel(); if let hotkey { UnregisterEventHotKey(hotkey); self.hotkey = nil }
         if let handler { RemoveEventHandler(handler); self.handler = nil }
         settingsWindow?.delegate = nil; settingsWindow?.close(); settingsWindow = nil
+        permissionWindow?.close(); permissionWindow = nil
     }
     func begin() {
         guard !busy else { editor?.window.makeKeyAndOrderFront(nil); return }
-        guard CGPreflightScreenCaptureAccess() else {
-            CGRequestScreenCaptureAccess()
-            notify("请在系统设置 → 隐私与安全性 → 屏幕录制中允许 Clip，然后重新尝试截图。必要时重新启动 Clip。")
+        guard CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() else {
+            showPermissionHelp()
             return
         }
+        permissionWindow?.orderOut(nil)
         previousApp = NSWorkspace.shared.frontmostApplication
         busy = true; generation += 1
         let token = generation
@@ -127,7 +130,7 @@ private final class CaptureController: NSObject, NSWindowDelegate {
         func next(_ index: Int) {
             guard token == self.generation else { return }
             if index == screens.count {
-                guard !images.isEmpty else { self.cancel(); notify("无法获取屏幕画面，请检查屏幕录制权限。"); return }
+                guard !images.isEmpty else { self.cancel(); self.showPermissionHelp(captureFailed: true); return }
                 for (screen, image) in images {
                     let panel = CapturePanel(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
                     panel.level = .screenSaver; panel.isOpaque = true; panel.hasShadow = false
@@ -145,6 +148,82 @@ private final class CaptureController: NSObject, NSWindowDelegate {
             }
         }
         next(0)
+    }
+    // Request access from this process so macOS identifies the running app.
+    // The user still controls the system switch; never edit the TCC database.
+    func showPermissionHelp(captureFailed: Bool = false) {
+        if let permissionWindow {
+            permissionWindow.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return
+        }
+        let panel = CapturePanel(contentRect: CGRect(x: 0, y: 0, width: 540, height: 300), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        panel.title = "允许 Clip 截图"; panel.isReleasedWhenClosed = false
+        let message = NSTextField(wrappingLabelWithString: captureFailed
+            ? "暂时无法读取屏幕。请检查当前 Clip 的屏幕录制权限；如果已开启，可以先退出并重新打开 Clip。"
+            : "Clip 已向 macOS 申请屏幕录制权限。打开授权设置后，开启 Clip 的开关；系统要求时退出并重新打开 Clip。")
+        message.frame = CGRect(x: 20, y: 222, width: 500, height: 58); panel.contentView?.addSubview(message)
+        let path = NSTextField(wrappingLabelWithString: "当前应用：\(Bundle.main.bundleURL.path)")
+        path.isSelectable = true; path.font = .systemFont(ofSize: 11)
+        path.frame = CGRect(x: 20, y: 174, width: 500, height: 42); panel.contentView?.addSubview(path)
+        let hint = NSTextField(wrappingLabelWithString: "更新后旧授权可能失效。无需猜选哪个应用：点“定位当前 Clip”即可找到正在运行的这一份，必要时用它替换列表中的旧项。")
+        hint.font = .systemFont(ofSize: 12); hint.frame = CGRect(x: 20, y: 112, width: 500, height: 55); panel.contentView?.addSubview(hint)
+        for (title, action, x, width) in [
+            ("打开授权设置", #selector(openScreenPermissionSettings), 20, 145),
+            ("定位当前 Clip", #selector(revealCurrentApp), 175, 145),
+            ("已允许，继续截图", #selector(resumeCapture), 330, 190)
+        ] {
+            let control = button(title, self, action)
+            control.frame = CGRect(x: x, y: 70, width: width, height: 32); panel.contentView?.addSubview(control)
+        }
+        let repair = button("重新申请本应用授权", self, #selector(repairScreenPermission(_:)))
+        repair.frame = CGRect(x: 20, y: 20, width: 170, height: 32); panel.contentView?.addSubview(repair)
+        let status = NSTextField(wrappingLabelWithString: "仅在旧授权无法使用时重置 Clip 的屏幕录制授权。")
+        status.font = .systemFont(ofSize: 11); status.frame = CGRect(x: 200, y: 14, width: 320, height: 42)
+        panel.contentView?.addSubview(status); permissionStatus = status
+        permissionWindow = panel; panel.center(); panel.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+    }
+    @objc func openScreenPermissionSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+    @objc func revealCurrentApp() {
+        NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+    }
+    @objc func resumeCapture() {
+        guard CGPreflightScreenCaptureAccess() else {
+            permissionStatus?.stringValue = "授权尚未生效。请开启 Clip 开关；若已开启，请退出并重新打开 Clip。"
+            return
+        }
+        permissionWindow?.orderOut(nil); begin()
+    }
+    @objc func repairScreenPermission(_ sender: NSButton) {
+        // Only a real installed app can reset its own entry. No global reset.
+        guard Bundle.main.bundleURL.pathExtension == "app",
+              Bundle.main.bundleIdentifier == "com.cyeam.miclip" else {
+            permissionStatus?.stringValue = "请使用安装后的 Clip.app 申请授权。"; return
+        }
+        let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        process.arguments = ["reset", "ScreenCapture", "com.cyeam.miclip"]
+        process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
+        sender.isEnabled = false
+        permissionStatus?.stringValue = "正在清理 Clip 的旧授权…"
+        process.terminationHandler = { [weak self, weak sender] completed in
+            let success = completed.terminationStatus == 0
+            DispatchQueue.main.async {
+                sender?.isEnabled = true
+                guard let self else { return }
+                guard success else {
+                    self.permissionStatus?.stringValue = "无法重新申请，请在授权设置中替换旧 Clip。"; return
+                }
+                self.permissionStatus?.stringValue = "已清理 Clip 的旧授权。请重新允许；若未出现提示，请退出并重新打开 Clip 后截图。"
+                _ = CGRequestScreenCaptureAccess()
+                self.openScreenPermissionSettings()
+            }
+        }
+        do { try process.run() } catch {
+            sender.isEnabled = true
+            permissionStatus?.stringValue = "无法重新申请，请在授权设置中替换旧 Clip。"
+        }
     }
     func selected(_ view: SelectionView) {
         selectedView = view

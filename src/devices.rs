@@ -2,7 +2,7 @@
 use crate::tray::TrayEvent;
 use async_channel::Sender;
 use std::{
-    net::{SocketAddr, ToSocketAddrs},
+    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -87,7 +87,7 @@ fn session_label(status: &str, detail: &str) -> String {
         "已连接" => "已连接 · 认证通过".into(),
         "连接中" | "认证中" => status.into(),
         _ if !detail.is_empty() => format!("{status} · {detail}"),
-        _ => "未连接 · 自动重试".into(),
+        _ => "未连接 · 等待设备上线".into(),
     }
 }
 
@@ -115,10 +115,10 @@ pub fn start(events: Sender<TrayEvent>, stop: Arc<AtomicBool>) -> mpsc::SyncSend
                         }) {
                             continue;
                         }
-                        let addresses = (endpoint.host.as_str(), endpoint.kcp_port)
-                            .to_socket_addrs()
-                            .map(|a| a.collect())
-                            .unwrap_or_default();
+                        let addresses: Vec<_> = endpoint.remote_addresses().collect();
+                        if addresses.is_empty() {
+                            continue;
+                        }
                         let name = endpoint.model.filter(|s| !s.is_empty()).unwrap_or_else(|| {
                             endpoint.host.trim_end_matches(".local.").to_owned()
                         });
@@ -225,6 +225,6 @@ mod tests {
         devices
             .sessions
             .insert(address, ("等待重连", String::new()));
-        assert!(devices.rows("等待重连")[0].1.contains("自动重试"));
+        assert!(devices.rows("等待重连")[0].1.contains("等待设备上线"));
     }
 }

@@ -2,6 +2,7 @@ use crate::tray::TrayEvent;
 use async_channel::Sender;
 use mi_clip::handshake::{self, SyncEvent};
 use std::{
+    net::SocketAddr,
     path::PathBuf,
     sync::{
         Arc,
@@ -14,47 +15,82 @@ use std::{
 /// authentication state, clipboard cursor and retry loop. A pending share adds
 /// its target without disrupting any existing session.
 pub fn start(config: PathBuf, events: Sender<TrayEvent>, stop: Arc<AtomicBool>) {
+    supervise(config, events, stop, || {
+        let mut targets: Vec<_> = mi_clip::share_queue::discovered_devices()
+            .into_iter()
+            .map(|device| device.endpoint)
+            .collect();
+        targets.extend(mi_clip::share_queue::pending_targets());
+        targets
+    });
+}
+
+fn supervise(
+    config: PathBuf,
+    events: Sender<TrayEvent>,
+    stop: Arc<AtomicBool>,
+    candidates: impl Fn() -> Vec<SocketAddr> + Send + 'static,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let mut sessions = std::collections::HashMap::new();
-        let _ = events.try_send(TrayEvent::Status("连接中", "正在发现局域网设备".into()));
+        let mut sessions: std::collections::HashMap<
+            _,
+            (std::thread::JoinHandle<()>, Arc<AtomicBool>),
+        > = std::collections::HashMap::new();
+        let _ = events.try_send(TrayEvent::Status("等待设备", "设备上线后将自动连接".into()));
+        let mut config_available = true;
         while !stop.load(Ordering::Relaxed) {
-            let fallback = match handshake::configured_endpoint(&config) {
-                Ok(endpoint) => endpoint,
+            match handshake::validate_config(&config) {
+                Ok(()) if !config_available => {
+                    config_available = true;
+                    let _ = events
+                        .try_send(TrayEvent::Status("等待设备", "设备上线后将自动连接".into()));
+                }
+                Ok(()) => (),
                 Err(error) => {
-                    let detail = format!("发现设备／读取配置失败：{error:#}");
-                    let _ = events.try_send(TrayEvent::Status(
-                        "等待重连",
-                        format!("{detail} · 2 秒后重试"),
-                    ));
-                    for _ in 0..8 {
-                        if stop.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        std::thread::sleep(Duration::from_millis(250));
+                    if config_available {
+                        config_available = false;
+                        eprintln!("Mi Clip account configuration unavailable: {error:#}");
+                        let _ = events
+                            .try_send(TrayEvent::Status("尚未登录", "请检查小米账号配置".into()));
                     }
-                    let _ = events.try_send(TrayEvent::Status("连接中", detail));
+                    std::thread::sleep(Duration::from_millis(250));
                     continue;
                 }
-            };
-            let mut targets: Vec<_> = mi_clip::share_queue::discovered_devices()
-                .into_iter()
-                .map(|device| device.endpoint)
-                .collect();
-            if targets.is_empty() {
-                targets.extend(fallback);
             }
-            targets.extend(mi_clip::share_queue::pending_targets());
+            let mut targets = candidates();
+            targets.retain(|target| !mi_clip::discovery::is_local_address(*target));
+            sessions.retain(|target, (handle, session_stop)| {
+                if !targets.contains(target) && !mi_clip::share_queue::is_connected(*target) {
+                    session_stop.store(true, Ordering::Relaxed);
+                }
+                if handle.is_finished() {
+                    let _ = events.send_blocking(TrayEvent::SessionStatus(
+                        *target,
+                        "未发现",
+                        String::new(),
+                    ));
+                    false
+                } else {
+                    true
+                }
+            });
             for target in targets {
                 sessions.entry(target).or_insert_with(|| {
-                    start_session(config.clone(), target, events.clone(), stop.clone())
+                    let session_stop = Arc::new(AtomicBool::new(false));
+                    let handle =
+                        start_session(config.clone(), target, events.clone(), session_stop.clone());
+                    (handle, session_stop)
                 });
             }
             std::thread::sleep(Duration::from_millis(250));
         }
-        for (_, session) in sessions {
+        for (_, (_, session_stop)) in &sessions {
+            session_stop.store(true, Ordering::Relaxed);
+        }
+        for (_, (session, _)) in sessions {
             let _ = session.join();
         }
-    });
+    })
 }
 
 fn start_session(
@@ -65,15 +101,14 @@ fn start_session(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut backoff = 2;
-        let mut last_error = String::new();
+        let mut waiting = false;
         let analytics = std::cell::RefCell::new(mi_clip::analytics::Session::default());
         while !stop.load(Ordering::Relaxed) {
             analytics.borrow_mut().begin();
-            let _ = events.send_blocking(TrayEvent::SessionStatus(
-                target,
-                "连接中",
-                last_error.clone(),
-            ));
+            if !waiting {
+                let _ =
+                    events.send_blocking(TrayEvent::SessionStatus(target, "连接中", String::new()));
+            }
             let connected = std::cell::Cell::new(false);
             let attempted = std::cell::Cell::new(None);
             let phase = std::cell::Cell::new("发现设备／读取配置");
@@ -89,11 +124,11 @@ fn start_session(
                     SyncEvent::Connecting(endpoint) => {
                         attempted.set(Some(endpoint));
                         phase.set("建立设备通道");
-                        ("连接中", last_error.clone())
+                        return;
                     }
                     SyncEvent::Authenticating => {
                         phase.set("设备认证");
-                        ("认证中", last_error.clone())
+                        ("认证中", String::new())
                     }
                     SyncEvent::Connected => {
                         mi_clip::share_queue::set_connected(target, true);
@@ -155,7 +190,7 @@ fn start_session(
             if connected.get() {
                 backoff = 2;
             }
-            last_error = match result {
+            match result {
                 Err(error) => {
                     let detail = format!("{}失败：{error:#}", phase.get());
                     if let Some(target) = attempted.get() {
@@ -166,14 +201,14 @@ fn start_session(
                         .unwrap_or_default()
                         .as_secs();
                     eprintln!("[{timestamp}] Mi Clip: {detail}; retry in {backoff}s");
-                    detail
                 }
-                Ok(()) => "连接已结束".into(),
+                Ok(()) => (),
             };
+            waiting = true;
             let _ = events.send_blocking(TrayEvent::SessionStatus(
                 target,
-                "等待重连",
-                format!("{last_error} · {backoff} 秒后重试"),
+                "等待设备",
+                "暂未连接 · 设备可用时自动连接".into(),
             ));
             for _ in 0..backoff * 4 {
                 if stop.load(Ordering::Relaxed) {
@@ -261,9 +296,9 @@ mod tests {
         let mut retries = std::collections::HashSet::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while retries.len() < 2 && std::time::Instant::now() < deadline {
-            if let Ok(TrayEvent::SessionStatus(target, "等待重连", detail)) = receiver.try_recv()
+            if let Ok(TrayEvent::SessionStatus(target, "等待设备", detail)) = receiver.try_recv()
             {
-                assert!(detail.contains("os error 2"));
+                assert!(detail.contains("设备可用时自动连接"));
                 retries.insert(target);
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -276,7 +311,51 @@ mod tests {
     }
 
     #[test]
-    fn missing_config_reports_the_error_and_keeps_it_during_retry() {
+    fn ignores_saved_target_and_retires_withdrawn_discovery() {
+        let root = std::env::temp_dir().join(format!("miclip-withdrawn-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = root.join("config.json");
+        std::fs::write(&config, br#"{"endpoint":"192.0.2.1:1234","session":"absent.json","identity":"absent.json","account_certificate":"unused.pem"}"#).unwrap();
+        let target: SocketAddr = "192.0.2.2:1234".parse().unwrap();
+        let advertised = Arc::new(AtomicBool::new(false));
+        let discovery = advertised.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (events, receiver) = async_channel::unbounded();
+        let (scanned, scans) = std::sync::mpsc::channel();
+        let supervisor = supervise(config, events, stop.clone(), move || {
+            let _ = scanned.send(());
+            discovery
+                .load(Ordering::Relaxed)
+                .then_some(target)
+                .into_iter()
+                .collect()
+        });
+        let session_status = |expected| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                if let Ok(TrayEvent::SessionStatus(address, status, _)) = receiver.try_recv() {
+                    assert_eq!(address, target, "a saved address must not become a session");
+                    if status == expected {
+                        return true;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        };
+        scans.recv_timeout(Duration::from_secs(3)).unwrap();
+        scans.recv_timeout(Duration::from_secs(3)).unwrap();
+        advertised.store(true, Ordering::Relaxed);
+        assert!(session_status("等待设备"));
+        advertised.store(false, Ordering::Relaxed);
+        assert!(session_status("未发现"));
+        stop.store(true, Ordering::Relaxed);
+        supervisor.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_config_prompts_for_account_instead_of_connection_errors() {
         let (events, receiver) = async_channel::unbounded();
         let stop = Arc::new(AtomicBool::new(false));
         let missing = std::env::temp_dir()
@@ -285,24 +364,20 @@ mod tests {
         assert!(!missing.exists());
         start(missing, events, stop.clone());
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut failure = None;
-        let mut retained = false;
+        let mut prompted = false;
         while std::time::Instant::now() < deadline {
             if let Ok(TrayEvent::Status(status, detail)) = receiver.try_recv() {
-                if status == "等待重连" {
-                    assert!(detail.contains("发现设备／读取配置失败"));
-                    assert!(detail.contains("os error 2"));
-                    assert!(detail.contains("2 秒后重试"));
-                    failure = Some(detail);
-                } else if status == "连接中" && failure.is_some() {
-                    retained = detail.contains("os error 2");
+                assert_ne!(status, "连接中");
+                assert!(!detail.contains("重试"));
+                if status == "尚未登录" {
+                    assert_eq!(detail, "请检查小米账号配置");
+                    prompted = true;
                     break;
                 }
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         stop.store(true, Ordering::Relaxed);
-        assert!(failure.is_some(), "connection error was not reported");
-        assert!(retained, "retry cleared the previous connection error");
+        assert!(prompted, "missing account configuration was not reported");
     }
 }

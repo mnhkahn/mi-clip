@@ -601,9 +601,9 @@ pub fn sync_target(
     exchange(config, None, Some(stop), Some(target), on_event)
 }
 
-pub fn configured_endpoint(config: &Path) -> anyhow::Result<Option<SocketAddr>> {
-    let config: ProbeConfig = serde_json::from_slice(&std::fs::read(config)?)?;
-    Ok((config.endpoint.port() != 0).then_some(config.endpoint))
+pub fn validate_config(config: &Path) -> anyhow::Result<()> {
+    let _: ProbeConfig = serde_json::from_slice(&std::fs::read(config)?)?;
+    Ok(())
 }
 
 fn exchange(
@@ -644,12 +644,10 @@ fn exchange(
         .get_or_insert_with(crate::networking::Service::local_services);
     let selected_target = target;
     if stop.is_some() && selected_target.is_none() {
-        use std::net::ToSocketAddrs;
         if let Ok(endpoints) = crate::discovery::discover(Duration::from_secs(3)) {
             if let Some(address) = endpoints
                 .iter()
-                .filter_map(|e| (e.host.as_str(), e.kcp_port).to_socket_addrs().ok())
-                .flatten()
+                .flat_map(crate::discovery::Endpoint::remote_addresses)
                 .find(|a| a.is_ipv4())
             {
                 config.endpoint = address;

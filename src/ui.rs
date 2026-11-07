@@ -51,7 +51,7 @@ fn content_height(detail: &str) -> f32 {
     if detail.is_empty() {
         return 48.0;
     }
-    // Reserve wrapped lines for the full connection error chain.
+    // Reserve space for wrapped status details.
     let lines: usize = detail
         .lines()
         .map(|line| {
@@ -247,15 +247,15 @@ impl Render for Panel {
                 if self.devices.scanning {
                     "正在发现局域网设备…"
                 } else if self.devices.failed {
-                    "发现失败，请刷新重试"
+                    "暂未发现设备"
                 } else {
                     "未发现设备"
                 },
             ));
         }
         let has_device = !self.devices.entries.is_empty();
-        let discovery_note = if self.devices.failed {
-            "发现失败 · 列表为上次结果"
+        let discovery_note = if self.devices.failed && has_device {
+            "暂时无法刷新 · 显示上次发现的设备"
         } else if self.status == "已连接" {
             "双方认证通过 · 连接已建立"
         } else if !has_device {

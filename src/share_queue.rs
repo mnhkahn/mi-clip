@@ -231,6 +231,9 @@ static CONNECTED: std::sync::Mutex<Vec<std::net::SocketAddr>> = std::sync::Mutex
 pub fn discovered_devices() -> Vec<ShareDevice> {
     DISCOVERED.lock().unwrap().clone()
 }
+pub fn is_connected(target: std::net::SocketAddr) -> bool {
+    CONNECTED.lock().unwrap().contains(&target)
+}
 pub fn set_connected(target: std::net::SocketAddr, connected: bool) {
     let _publish = PUBLISH.lock().unwrap();
     let mut targets = CONNECTED.lock().unwrap();

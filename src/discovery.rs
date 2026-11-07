@@ -5,6 +5,7 @@ use serde::Serialize;
 use std::{
     collections::HashSet,
     ffi::{CStr, c_char, c_void},
+    net::{SocketAddr, ToSocketAddrs, UdpSocket},
     time::{Duration, Instant},
 };
 type Service = *mut c_void;
@@ -75,6 +76,15 @@ pub struct Endpoint {
     pub kcp_port: u16,
     pub device_type: u8,
     pub model: Option<String>,
+}
+impl Endpoint {
+    pub fn remote_addresses(&self) -> impl Iterator<Item = SocketAddr> {
+        (self.host.as_str(), self.kcp_port)
+            .to_socket_addrs()
+            .into_iter()
+            .flatten()
+            .filter(|address| !is_local_address(*address))
+    }
 }
 #[derive(Default)]
 struct State {
@@ -186,6 +196,16 @@ unsafe extern "C" fn browsed(
         state.services.push(service);
     }
 }
+/// Binding an ephemeral socket succeeds only for an address owned by this Mac.
+/// Keep the IPv6 scope ID while probing link-local interface addresses.
+pub fn is_local_address(mut address: SocketAddr) -> bool {
+    if address.ip().is_loopback() || address.ip().is_unspecified() {
+        return true;
+    }
+    address.set_port(0);
+    UdpSocket::bind(address).is_ok()
+}
+
 pub fn discover(timeout: Duration) -> anyhow::Result<Vec<Endpoint>> {
     anyhow::ensure!(
         timeout <= Duration::from_secs(30),
@@ -247,4 +267,20 @@ pub fn discover(timeout: Duration) -> anyhow::Result<Vec<Endpoint>> {
         anyhow::ensure!(!state.failed, "System DNS-SD response failed");
     }
     Ok(std::mem::take(&mut state.endpoints))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn excludes_this_mac_without_excluding_other_computers() {
+        for address in ["127.0.0.1:1234", "[::1]:1234", "0.0.0.0:1234"] {
+            assert!(is_local_address(address.parse().unwrap()));
+        }
+        assert!(!is_local_address("192.0.2.1:1234".parse().unwrap()));
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        if socket.connect("192.0.2.1:1234").is_ok() {
+            assert!(is_local_address(socket.local_addr().unwrap()));
+        }
+    }
 }
