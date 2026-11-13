@@ -3,6 +3,7 @@ fn main() {
     println!("cargo:rerun-if-changed=macos/Capture.swift");
     println!("cargo:rerun-if-changed=macos/CaptureCore.swift");
     println!("cargo:rerun-if-changed=macos/UpdateProxy.swift");
+    println!("cargo:rerun-if-changed=macos/LoginItem.swift");
     if env::var_os("CARGO_FEATURE_UI").is_none() {
         return;
     }
@@ -28,6 +29,7 @@ fn main() {
             "macos/CaptureCore.swift",
             "macos/Capture.swift",
             "macos/UpdateProxy.swift",
+            "macos/LoginItem.swift",
             "-o",
         ])
         .arg(output.join("libclip_capture.a"))
@@ -65,6 +67,7 @@ fn main() {
         "ScreenCaptureKit",
         "CoreGraphics",
         "CFNetwork",
+        "ServiceManagement",
     ] {
         println!("cargo:rustc-link-lib=framework={framework}");
     }

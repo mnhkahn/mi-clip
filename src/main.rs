@@ -1,6 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 mod capture;
 mod devices;
+mod login_item;
 mod notifications;
 mod probe;
 mod sharing_setup;
@@ -171,6 +172,8 @@ fn main() -> anyhow::Result<()> {
             ) {
                 eprintln!("Status item failed: {error}");
                 cx.quit();
+            } else if !smoke {
+                login_item::ensure_enabled();
             }
         });
     anyhow::ensure!(!smoke || passed.get(), "Status panel smoke test failed");
