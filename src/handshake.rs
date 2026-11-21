@@ -769,7 +769,13 @@ fn exchange(
         #[cfg(feature = "file-sharing")]
         {
             if let Some(sender) = outgoing.as_mut() {
-                match sender.poll() {
+                let result = sender.poll();
+                if result.is_ok() {
+                    // The separate file channel can stay active while the
+                    // main connection has no clipboard or control traffic.
+                    last_received = last_received.max(sender.last_activity());
+                }
+                match result {
                     Ok(true) => {
                         on_event(SyncEvent::ShareCompleted(
                             sender.request.offer.files.len() as u32

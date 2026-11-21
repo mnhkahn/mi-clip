@@ -507,6 +507,10 @@ impl Sender {
         Ok(false)
     }
 
+    pub fn last_activity(&self) -> Instant {
+        self.activity
+    }
+
     pub fn control_wait(&self) -> Duration {
         // Keep the control channel responsive without sleeping between every
         // TCP batch at the negotiation cadence.
@@ -656,6 +660,7 @@ mod tests {
             .unwrap();
         assert!(!sender.poll().unwrap());
         assert!(!root.join("downloads/sample.txt").exists());
+        let initial_activity = sender.last_activity();
         let stop = std::sync::atomic::AtomicBool::new(false);
         let elapsed = std::thread::scope(|scope| {
             use std::sync::atomic::Ordering::Relaxed;
@@ -681,6 +686,7 @@ mod tests {
             sent.unwrap()
         });
         assert!(sender.complete, "share did not receive completion");
+        assert!(sender.last_activity() > initial_activity);
         let saved = std::fs::read(root.join("downloads/sample.txt")).unwrap();
         assert_eq!(saved.len() as u64, sample_size);
         assert!(saved[..70_001].iter().all(|&byte| byte == 0x42));
