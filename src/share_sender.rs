@@ -87,6 +87,7 @@ pub(crate) struct Sender {
     saved_streams: Vec<u32>,
     finish_sent: bool,
     pending: Vec<u8>,
+    pending_stream: u32,
     pending_offset: usize,
     assembler: ft::BytesAssembler,
     complete: bool,
@@ -116,6 +117,7 @@ impl Sender {
             saved_streams: Vec::new(),
             finish_sent: false,
             pending: Vec::new(),
+            pending_stream: 0,
             pending_offset: 0,
             assembler: ft::BytesAssembler::default(),
             complete: false,
@@ -224,8 +226,10 @@ impl Sender {
         }
         let mut root = wire::integer(1, 1);
         root.extend(wire::message(2, &body));
-        // The same bounded validator is used in both directions.
-        crate::file_protocol::request(&root)?;
+        crate::file_protocol::request_with_limit(
+            &root,
+            crate::file_protocol::MAX_OUTGOING_SHARE_SIZE,
+        )?;
         Ok(root)
     }
     fn announce_streams(&mut self) -> anyhow::Result<()> {
@@ -354,7 +358,7 @@ impl Sender {
                     .find(|s| s.0 == id)
                     .ok_or_else(|| anyhow::anyhow!("Unknown share stream completion"))?;
                 anyhow::ensure!(
-                    stream.3 && stream.4 && self.pending.is_empty(),
+                    stream.3 && stream.4 && (self.pending.is_empty() || self.pending_stream != id),
                     "Premature share stream completion"
                 );
                 // Stream receipt precedes the task's command 8. Keep waiting
@@ -419,17 +423,20 @@ impl Sender {
         if self.complete {
             return Ok(true);
         }
-        if self.pending.is_empty() && self.accepted {
-            if let Some(s) = self.streams.iter_mut().find(|s| s.3 && !s.4) {
+        // Keep the existing record size and send a batch between control polls.
+        for _ in 0..64 {
+            if self.pending.is_empty() {
+                let Some(s) = self.streams.iter_mut().find(|s| s.3 && !s.4) else {
+                    break;
+                };
                 let bytes = self.request.offer.read(s.1, s.2)?;
                 self.pending =
                     crate::file_stream::seal(self.data_key.as_ref().unwrap(), s.0, s.2, &bytes)?;
                 s.2 += bytes.len() as u64;
                 s.4 = bytes.is_empty();
+                self.pending_stream = s.0;
                 self.pending_offset = 0;
             }
-        }
-        if !self.pending.is_empty() {
             match self
                 .stream
                 .as_mut()
@@ -446,7 +453,7 @@ impl Sender {
                             .status("sending", self.streams.iter().map(|s| s.2).sum())?;
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e.into()),
             }
         }
@@ -492,7 +499,7 @@ mod tests {
         assert!(accept_response(&[0x08, 0x02], b"task-one").is_err());
     }
 
-    fn setup() -> (std::path::PathBuf, Sender) {
+    fn setup(sample_size: u64) -> (std::path::PathBuf, Sender) {
         let root = std::env::temp_dir().join(format!(
             "clip-share-test-{:016x}",
             u64::from_ne_bytes(crate::private::random().unwrap())
@@ -500,7 +507,9 @@ mod tests {
         let directory = root.join("outbox/test.ready");
         std::fs::create_dir_all(directory.join("files")).unwrap();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::write(directory.join("files/sample.txt"), vec![0x42; 70_001]).unwrap();
+        let mut sample = std::fs::File::create(directory.join("files/sample.txt")).unwrap();
+        sample.write_all(&vec![0x42; 70_001]).unwrap();
+        sample.set_len(sample_size).unwrap();
         std::fs::write(directory.join("files/empty.bin"), b"").unwrap();
         std::fs::write(
             directory.join("request.json"),
@@ -513,9 +522,27 @@ mod tests {
         (root, Sender::new(request).unwrap())
     }
     #[test]
+    fn direct_share_accepts_an_18_gib_file_and_reads_its_last_byte() {
+        let size = 18 * 1024 * 1024 * 1024;
+        let (root, sender) = setup(size);
+        let packet = sender.manifest().unwrap();
+        let manifest = crate::file_protocol::request_with_limit(
+            &packet,
+            crate::file_protocol::MAX_OUTGOING_SHARE_SIZE,
+        )
+        .unwrap();
+        assert_eq!(manifest.files[0].size, size);
+        assert_eq!(sender.request.offer.read(0, size - 1).unwrap(), [0]);
+        assert!(sender.request.offer.read(0, size).unwrap().is_empty());
+        assert!(crate::file_protocol::request(&packet).is_err());
+        drop(sender);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn logical_share_request_contains_express_link_and_wifi_medium() {
         use base64::Engine;
-        let (root, sender) = setup();
+        let (root, sender) = setup(70_001);
         let request = sender.logical_request();
         let body = bytes(&request, 2).unwrap();
         assert_eq!(number(body, 1).unwrap(), 1);
@@ -544,7 +571,7 @@ mod tests {
 
     #[test]
     fn direct_share_saves_multiple_files_and_waits_for_receiver_confirmation() {
-        let (root, mut sender) = setup();
+        let (root, mut sender) = setup(70_001);
         let local = "127.0.0.1".parse().unwrap();
         let mut receiver = crate::file_channel::FileReceiver::open(
             local,
@@ -605,7 +632,7 @@ mod tests {
     }
     #[test]
     fn cancellation_and_premature_success_do_not_report_completion() {
-        let (root, mut sender) = setup();
+        let (root, mut sender) = setup(70_001);
         let mut message = wire::integer(1, 8);
         message.extend(wire::message(2, &wire::integer(1, 1)));
         let complete = ft::byte_message(0, &message).unwrap();
@@ -623,7 +650,7 @@ mod tests {
 
     #[test]
     fn saved_stream_receipt_waits_for_task_completion_and_rejects_failure() {
-        let (root, mut sender) = setup();
+        let (root, mut sender) = setup(70_001);
         let receipt = |code: i32, id: u32| {
             let mut body = ft::tlv(3, 0, &0u32.to_be_bytes()).unwrap();
             body.extend(ft::tlv(3, 1, &id.to_be_bytes()).unwrap());

@@ -125,7 +125,6 @@ final class ShareViewController: NSViewController {
     private var finished = false
     private var loading = false
     private var total: Int64 = 0
-    private let limit: Int64 = 8 * 1024 * 1024 * 1024
 
     override func loadView() {
         view = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 380))
@@ -231,8 +230,9 @@ final class ShareViewController: NSViewController {
                     throw NSError(domain: "Clip", code: 2, userInfo: [NSLocalizedDescriptionKey: "请选择普通文件。"])
                 }
                 let size = Int64(info.fileSize ?? 0)
-                guard self.total + size <= self.limit else {
-                    throw NSError(domain: "Clip", code: 3, userInfo: [NSLocalizedDescriptionKey: "单次分享最多 8 GiB。"])
+                let (newTotal, overflow) = self.total.addingReportingOverflow(size)
+                guard !overflow else {
+                    throw NSError(domain: "Clip", code: 3, userInfo: [NSLocalizedDescriptionKey: "文件总大小超出可表示范围。"])
                 }
                 var name = url.lastPathComponent
                 if names.contains(name) { name = "\(index + 1)-\(name)" }
@@ -241,7 +241,7 @@ final class ShareViewController: NSViewController {
                 try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
                 DispatchQueue.main.async {
                     guard !self.finished else { return }
-                    self.total += size
+                    self.total = newTotal
                     self.load(providers, index: index + 1, names: names + [name])
                 }
             } catch { DispatchQueue.main.async { self.fail("无法读取文件：\(error.localizedDescription)") } }

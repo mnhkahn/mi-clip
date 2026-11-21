@@ -2,6 +2,9 @@
 //! Acceptance permits transport inspection; it does not publish a file.
 use crate::wire::{self, Field};
 
+// Express stream offers use signed 64-bit file lengths.
+pub(crate) const MAX_OUTGOING_SHARE_SIZE: u64 = i64::MAX as u64;
+
 pub(crate) struct Manifest<'a> {
     kind: u32,
     pub task: &'a [u8],
@@ -50,6 +53,13 @@ fn identifier(value: &[u8]) -> anyhow::Result<()> {
 }
 
 pub(crate) fn request(input: &[u8]) -> anyhow::Result<Manifest<'_>> {
+    request_with_limit(input, crate::file_store::MAX_FILE_SIZE)
+}
+
+pub(crate) fn request_with_limit(
+    input: &[u8],
+    max_total_size: u64,
+) -> anyhow::Result<Manifest<'_>> {
     let root = fields(input)?;
     anyhow::ensure!(integer(&root, 1)? == 1, "Not a file-send request");
     let request = fields(bytes(&root, 2)?)?;
@@ -79,10 +89,7 @@ pub(crate) fn request(input: &[u8]) -> anyhow::Result<Manifest<'_>> {
         total = total
             .checked_add(size)
             .ok_or_else(|| anyhow::anyhow!("Shared file size overflow"))?;
-        anyhow::ensure!(
-            total <= crate::file_store::MAX_FILE_SIZE,
-            "Shared files exceed size limit"
-        );
+        anyhow::ensure!(total <= max_total_size, "Shared files exceed size limit");
         files.push(FileInfo { name, id, size });
     }
     anyhow::ensure!(!files.is_empty(), "File-share request contains no files");

@@ -68,7 +68,7 @@ impl Request {
                     Ok(directory.join("files").join(name))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            let offer = crate::clipboard_files::Offer::open(paths, 0)?;
+            let offer = crate::clipboard_files::Offer::open_for_share(paths)?;
             let mut request = Self {
                 directory,
                 target: description.target,

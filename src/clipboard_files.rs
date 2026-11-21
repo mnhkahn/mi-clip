@@ -101,6 +101,12 @@ impl Offer {
         }
     }
     pub fn open(paths: Vec<PathBuf>, sequence: u8) -> anyhow::Result<Self> {
+        Self::open_files(paths, sequence, crate::file_store::MAX_FILE_SIZE)
+    }
+    pub fn open_for_share(paths: Vec<PathBuf>) -> anyhow::Result<Self> {
+        Self::open_files(paths, 0, crate::file_protocol::MAX_OUTGOING_SHARE_SIZE)
+    }
+    fn open_files(paths: Vec<PathBuf>, sequence: u8, max_total_size: u64) -> anyhow::Result<Self> {
         anyhow::ensure!(
             (1..=128).contains(&paths.len()),
             "Unsupported clipboard file count"
@@ -127,10 +133,7 @@ impl Offer {
             total = total
                 .checked_add(size)
                 .ok_or_else(|| anyhow::anyhow!("Clipboard size overflow"))?;
-            anyhow::ensure!(
-                total <= crate::file_store::MAX_FILE_SIZE,
-                "Clipboard files exceed size limit"
-            );
+            anyhow::ensure!(total <= max_total_size, "Offered files exceed size limit");
             let (code, mime) = file_type(name);
             files.push(Source {
                 data: SourceData::File(file, stamp),
