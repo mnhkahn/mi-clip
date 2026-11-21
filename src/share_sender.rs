@@ -4,6 +4,7 @@ use crate::{
     file_transport as ft,
     wire::{self, Field},
 };
+use anyhow::Context;
 use std::{
     io::Write,
     net::{SocketAddr, TcpStream, UdpSocket},
@@ -89,6 +90,8 @@ pub(crate) struct Sender {
     pending: Vec<u8>,
     pending_stream: u32,
     pending_offset: usize,
+    tcp_blocked_since: Option<Instant>,
+    tcp_stall_reported: bool,
     assembler: ft::BytesAssembler,
     complete: bool,
 }
@@ -119,6 +122,8 @@ impl Sender {
             pending: Vec::new(),
             pending_stream: 0,
             pending_offset: 0,
+            tcp_blocked_since: None,
+            tcp_stall_reported: false,
             assembler: ft::BytesAssembler::default(),
             complete: false,
         })
@@ -203,7 +208,7 @@ impl Sender {
         self.reliable = Some(reliable);
         self.address = Some(address);
         self.activity = Instant::now();
-        eprintln!("Mi Clip Share: peer port accepted; starting encrypted transfer channel");
+        self.request.log("peer_port_accepted", "");
         Ok(())
     }
     fn send(&mut self, message: &[u8]) -> anyhow::Result<()> {
@@ -270,13 +275,15 @@ impl Sender {
                 let key: [u8; 16] = node(&fields, 4, 5)?.try_into()?;
                 anyhow::ensure!(port != 0, "Invalid share data port");
                 let address = SocketAddr::new(self.address.unwrap().ip(), port);
-                let stream = TcpStream::connect_timeout(&address, Duration::from_secs(3))?;
+                let stream = TcpStream::connect_timeout(&address, Duration::from_secs(3))
+                    .context("Connecting the TCP data socket")?;
                 stream.set_nonblocking(true)?;
                 self.stream = Some(stream);
                 self.data_key = Some(key);
                 self.send(&ft::byte_message(0, &self.manifest()?)?)?;
                 self.announced = true;
-                eprintln!("Mi Clip Share: file manifest sent; waiting for phone acceptance");
+                self.request
+                    .log("manifest_sent", "waiting for phone acceptance");
                 self.request.status("waiting", 0)?;
             }
             (0x100, 2) => {
@@ -312,7 +319,7 @@ impl Sender {
                             let response = bytes(&message, 2)?;
                             accept_response(response, self.task.as_bytes())?;
                             self.accepted = true;
-                            eprintln!("Mi Clip Share: phone accepted file manifest");
+                            self.request.log("manifest_accepted", "");
                             self.announce_streams()?;
                         }
                         8 => {
@@ -344,6 +351,8 @@ impl Sender {
                     .ok_or_else(|| anyhow::anyhow!("Unknown share stream"))?;
                 anyhow::ensure!(!stream.3, "Duplicate share stream request");
                 stream.3 = true;
+                self.request
+                    .log("stream_requested", &format!("stream={id}"));
             }
             (0x100, 5) => {
                 let fields = ft::nodes(frame.value)?;
@@ -366,7 +375,7 @@ impl Sender {
                 if !self.saved_streams.contains(&id) {
                     self.saved_streams.push(id);
                 }
-                eprintln!("Mi Clip Share: phone confirmed a saved file stream");
+                self.request.log("stream_saved", &format!("stream={id}"));
             }
             _ => {
                 let schema = ft::nodes(frame.value)?
@@ -388,7 +397,9 @@ impl Sender {
         anyhow::ensure!(
             self.activity.elapsed() < Duration::from_secs(60)
                 && (self.accepted || self.started.elapsed() < Duration::from_secs(600)),
-            "Share timed out"
+            "Share timed out (last activity {} s ago, manifest accepted: {})",
+            self.activity.elapsed().as_secs(),
+            self.accepted
         );
         if let Some(socket) = self.socket.as_ref() {
             let mut buffer = [0; 65536];
@@ -429,7 +440,11 @@ impl Sender {
                 let Some(s) = self.streams.iter_mut().find(|s| s.3 && !s.4) else {
                     break;
                 };
-                let bytes = self.request.offer.read(s.1, s.2)?;
+                let bytes = self
+                    .request
+                    .offer
+                    .read(s.1, s.2)
+                    .context("Reading the staged file")?;
                 self.pending =
                     crate::file_stream::seal(self.data_key.as_ref().unwrap(), s.0, s.2, &bytes)?;
                 s.2 += bytes.len() as u64;
@@ -443,8 +458,13 @@ impl Sender {
                 .unwrap()
                 .write(&self.pending[self.pending_offset..])
             {
-                Ok(0) => anyhow::bail!("Share socket closed"),
+                Ok(0) => anyhow::bail!("TCP data socket closed during write"),
                 Ok(count) => {
+                    self.tcp_blocked_since = None;
+                    if self.tcp_stall_reported {
+                        self.request.log("tcp_writable", "TCP writes resumed");
+                        self.tcp_stall_reported = false;
+                    }
                     self.pending_offset += count;
                     self.activity = Instant::now();
                     if self.pending_offset == self.pending.len() {
@@ -453,8 +473,18 @@ impl Sender {
                             .status("sending", self.streams.iter().map(|s| s.2).sum())?;
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e.into()),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    let since = self.tcp_blocked_since.get_or_insert_with(Instant::now);
+                    if !self.tcp_stall_reported && since.elapsed().as_secs() >= 5 {
+                        self.request.log(
+                            "tcp_blocked",
+                            "TCP writes returned WouldBlock for 5 seconds",
+                        );
+                        self.tcp_stall_reported = true;
+                    }
+                    break;
+                }
+                Err(e) => return Err(e).context("Writing to the TCP data socket"),
             }
         }
         if self.accepted
@@ -471,9 +501,20 @@ impl Sender {
             finish.extend(wire::message(2, &wire::integer(1, 1)));
             self.send(&ft::byte_message(0, &finish)?)?;
             self.finish_sent = true;
-            eprintln!("Mi Clip Share: all file streams saved; task finish sent");
+            self.request
+                .log("finish_sent", "waiting for final phone confirmation");
         }
         Ok(false)
+    }
+
+    pub fn control_wait(&self) -> Duration {
+        // Keep the control channel responsive without sleeping between every
+        // TCP batch at the negotiation cadence.
+        if !self.pending.is_empty() || self.streams.iter().any(|s| s.3 && !s.4) {
+            Duration::from_millis(2)
+        } else {
+            Duration::from_millis(20)
+        }
     }
 }
 
@@ -571,7 +612,20 @@ mod tests {
 
     #[test]
     fn direct_share_saves_multiple_files_and_waits_for_receiver_confirmation() {
-        let (root, mut sender) = setup(70_001);
+        exercise_direct_share(70_001, Sender::control_wait);
+    }
+
+    #[test]
+    #[ignore = "Manual loopback timing comparison"]
+    fn compare_direct_share_poll_intervals() {
+        let size = 16 * 1024 * 1024;
+        let baseline = exercise_direct_share(size, |_| Duration::from_millis(20));
+        let faster = exercise_direct_share(size, Sender::control_wait);
+        println!("16 MiB: fixed 20 ms {baseline:.2?}, adaptive 2/20 ms {faster:.2?}");
+    }
+
+    fn exercise_direct_share(sample_size: u64, wait: fn(&Sender) -> Duration) -> Duration {
+        let (root, mut sender) = setup(sample_size);
         let local = "127.0.0.1".parse().unwrap();
         let mut receiver = crate::file_channel::FileReceiver::open(
             local,
@@ -602,19 +656,35 @@ mod tests {
             .unwrap();
         assert!(!sender.poll().unwrap());
         assert!(!root.join("downloads/sample.txt").exists());
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while Instant::now() < deadline {
-            receiver.poll().unwrap();
-            if sender.poll().unwrap() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let elapsed = std::thread::scope(|scope| {
+            use std::sync::atomic::Ordering::Relaxed;
+            let receiver = scope.spawn(|| {
+                while !stop.load(Relaxed) {
+                    receiver.poll()?;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                anyhow::Ok(())
+            });
+            let started = Instant::now();
+            let sent: anyhow::Result<_> = (|| {
+                while started.elapsed() < Duration::from_secs(20) {
+                    if sender.poll()? {
+                        break;
+                    }
+                    std::thread::sleep(wait(&sender));
+                }
+                Ok(started.elapsed())
+            })();
+            stop.store(true, Relaxed);
+            receiver.join().unwrap().unwrap();
+            sent.unwrap()
+        });
         assert!(sender.complete, "share did not receive completion");
-        assert_eq!(
-            std::fs::read(root.join("downloads/sample.txt")).unwrap(),
-            vec![0x42; 70_001]
-        );
+        let saved = std::fs::read(root.join("downloads/sample.txt")).unwrap();
+        assert_eq!(saved.len() as u64, sample_size);
+        assert!(saved[..70_001].iter().all(|&byte| byte == 0x42));
+        assert!(saved[70_001..].iter().all(|&byte| byte == 0));
         assert_eq!(
             std::fs::metadata(root.join("downloads/empty.bin"))
                 .unwrap()
@@ -629,6 +699,7 @@ mod tests {
         drop(sender);
         drop(receiver);
         std::fs::remove_dir_all(root).unwrap();
+        elapsed
     }
     #[test]
     fn cancellation_and_premature_success_do_not_report_completion() {

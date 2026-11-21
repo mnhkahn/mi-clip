@@ -870,11 +870,17 @@ fn exchange(
         );
         // Manual file probes must remain available between phone interactions.
         // Their overall configured deadline still bounds the session.
-        anyhow::ensure!(
-            (directory.is_some() && authenticated)
-                || last_received.elapsed() < Duration::from_secs(120),
-            "Phone connection timed out"
-        );
+        if !(directory.is_some() && authenticated)
+            && last_received.elapsed() >= Duration::from_secs(120)
+        {
+            #[cfg(feature = "file-sharing")]
+            if let Some(sender) = outgoing.as_mut() {
+                let _ = sender
+                    .request
+                    .fail("Phone control connection idle for 120 seconds");
+            }
+            anyhow::bail!("Phone connection timed out");
+        }
         #[cfg(feature = "clipboard")]
         if config.clipboard_sync && network_ready && active_key.is_some() {
             let snapshot = crate::clipboard::read_update(clipboard_count, initial_clipboard);
@@ -955,14 +961,24 @@ fn exchange(
         }
         let tick = Duration::from_millis(250);
         #[cfg(feature = "file-sharing")]
-        let tick = if outgoing.is_some() || port_probe.as_ref().is_some_and(|probe| probe.running())
-        {
-            Duration::from_millis(20)
-        } else {
-            tick
+        let tick = match outgoing.as_ref() {
+            Some(sender) => sender.control_wait(),
+            None if port_probe.as_ref().is_some_and(|probe| probe.running()) => {
+                Duration::from_millis(20)
+            }
+            None => tick,
         };
         let slice = deadline.min(Instant::now() + tick);
-        let Some(reply) = transport.receive(slice)? else {
+        let reply = transport.receive(slice).map_err(|error| {
+            #[cfg(feature = "file-sharing")]
+            if let Some(sender) = outgoing.as_mut() {
+                let _ = sender
+                    .request
+                    .fail(&format!("Phone control connection failed: {error:#}"));
+            }
+            error
+        })?;
+        let Some(reply) = reply else {
             continue;
         };
         last_received = Instant::now();
@@ -1176,7 +1192,10 @@ fn exchange(
                         "Peer closed file logical connection: code {code}; ready for a new request."
                     );
                     #[cfg(feature = "file-sharing")]
-                    if outgoing.take().is_some() {
+                    if let Some(mut sender) = outgoing.take() {
+                        let _ = sender
+                            .request
+                            .fail(&format!("Phone closed the share channel (code {code})"));
                         on_event(SyncEvent::ShareFailed);
                     }
                     file_connection = None;
@@ -1246,9 +1265,9 @@ fn exchange(
                         let mut ack = integer(1, 3);
                         ack.extend(message(4, &[]));
                         transport.send(&logical_encrypted(&reply[4..], session_key, &ack)?)?;
-                        eprintln!(
-                            "Mi Clip Share: phone accepted logical channel; requesting transfer port"
-                        );
+                        sender
+                            .request
+                            .log("channel_accepted", "requesting transfer port");
                         let mut payload = vec![sender.peer.unwrap(), 0];
                         payload.extend(sender.port_request()?);
                         transport.send(&frame(0x29, &payload)?)?;
@@ -1333,7 +1352,12 @@ fn exchange(
                             );
                             #[cfg(feature = "file-sharing")]
                             if let Some(sender) = outgoing.as_mut() {
-                                sender.connect(&control, config.endpoint)?;
+                                if let Err(error) = sender.connect(&control, config.endpoint) {
+                                    let _ = sender
+                                        .request
+                                        .fail(&format!("Opening the share channel: {error:#}"));
+                                    return Err(error);
+                                }
                                 continue;
                             }
                             #[cfg(feature = "file-sharing")]

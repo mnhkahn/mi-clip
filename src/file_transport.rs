@@ -83,7 +83,12 @@ pub(crate) fn open(key: &[u8; 32], packet: &[u8]) -> anyhow::Result<Vec<u8>> {
             );
             8
         }
-        _ => anyhow::bail!("Unsupported bulk packet header"),
+        _ => anyhow::bail!(
+            "Unsupported bulk packet header ({:02x}/{:02x}, {} bytes)",
+            packet[0],
+            packet[1],
+            packet.len()
+        ),
     };
     anyhow::ensure!(
         usize::from(u16::from_be_bytes(packet[2..4].try_into()?)) == packet.len(),

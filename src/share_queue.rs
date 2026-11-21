@@ -12,6 +12,8 @@ pub(crate) struct Request {
     finished: bool,
     failure: Option<String>,
     last_progress: std::time::Instant,
+    sent: u64,
+    last_logged_progress: Option<std::time::Instant>,
 }
 impl Request {
     #[cfg(test)]
@@ -76,7 +78,17 @@ impl Request {
                 finished: false,
                 failure: None,
                 last_progress: std::time::Instant::now(),
+                sent: 0,
+                last_logged_progress: None,
             };
+            request.log(
+                "claimed",
+                &format!(
+                    "files={} total_bytes={}",
+                    request.offer.files.len(),
+                    request.total()
+                ),
+            );
             request.status("connecting", 0)?;
             return Ok(Some(request));
         }
@@ -86,6 +98,7 @@ impl Request {
         self.directory.is_dir()
     }
     pub fn status(&mut self, state: &str, sent: u64) -> anyhow::Result<()> {
+        self.sent = sent;
         if state == "sending"
             && self.last_progress.elapsed() < std::time::Duration::from_millis(250)
         {
@@ -115,26 +128,96 @@ impl Request {
             let _ = std::fs::remove_file(temp);
         }
         result?;
+        if state == "sending"
+            && self
+                .last_logged_progress
+                .is_none_or(|at| at.elapsed().as_secs() >= 15)
+        {
+            self.log("progress", "");
+            self.last_logged_progress = Some(std::time::Instant::now());
+        }
         Ok(())
+    }
+    fn total(&self) -> u64 {
+        self.offer.files.iter().map(|f| f.size).sum()
+    }
+    pub fn log(&self, event: &str, detail: &str) {
+        if cfg!(test) {
+            return;
+        }
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        // The extension assigns a random UUID to each request directory.
+        let id = self
+            .directory
+            .file_stem()
+            .and_then(|id| id.to_str())
+            .filter(|id| id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
+            .unwrap_or("unknown");
+        let line = serde_json::json!({
+            "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_secs(),
+            "transfer": id,
+            "event": event,
+            "sent_bytes": self.sent,
+            "detail": detail,
+        });
+        let directory = PathBuf::from(home).join("Library/Logs/MiClip");
+        if let Err(error) = append_log(&directory, &line) {
+            eprintln!("Mi Clip cannot save share diagnostics: {error}");
+        }
     }
     pub fn fail(&mut self, message: &str) -> anyhow::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.log("failed", message);
         self.failure = Some(message.to_owned());
-        self.status("failed", 0)?;
         self.finished = true;
-        Ok(())
+        self.status("failed", self.sent)
     }
     pub fn complete(&mut self) -> anyhow::Result<()> {
-        self.status("completed", self.offer.files.iter().map(|f| f.size).sum())?;
+        self.status("completed", self.total())?;
         self.finished = true;
+        self.log("completed", "phone confirmed the complete transfer");
         Ok(())
     }
 }
 impl Drop for Request {
     fn drop(&mut self) {
-        if !self.finished && self.exists() {
-            let _ = self.status("failed", 0);
+        if !self.finished {
+            if self.exists() {
+                let _ = self.fail("Share session ended without completion");
+            } else {
+                self.log("cancelled", "share request directory was removed");
+            }
         }
     }
+}
+
+fn append_log(directory: &Path, event: &serde_json::Value) -> std::io::Result<()> {
+    use std::{
+        io::Write,
+        os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    };
+    static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOG_LOCK.lock().unwrap();
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)?;
+    let path = directory.join("share.log");
+    if path.metadata().is_ok_and(|info| info.len() >= 256 * 1024) {
+        std::fs::rename(&path, directory.join("share.previous.log"))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(0x100) // macOS O_NOFOLLOW
+        .open(path)?;
+    writeln!(file, "{event}")
 }
 unsafe extern "C" {
     fn getuid() -> u32;
@@ -304,13 +387,16 @@ mod tests {
             br#"{"files":["test.txt"],"target":"127.0.0.1:1"}"#,
         )
         .unwrap();
-        let request = Request::next(&root).unwrap().unwrap();
+        let mut request = Request::next(&root).unwrap().unwrap();
         assert!(Request::next(&root).unwrap().is_none());
         assert_eq!(request.offer.read(0, 0).unwrap(), b"synthetic");
+        request.status("sending", 4).unwrap();
         drop(request);
         let status: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("status.json")).unwrap()).unwrap();
         assert_eq!(status["state"], "failed");
+        assert_eq!(status["sent"], 4);
+        assert_eq!(status["message"], "Share session ended without completion");
         std::fs::remove_file(dir.join("status.json")).unwrap();
         std::fs::write(
             dir.join("request.json"),
@@ -318,6 +404,35 @@ mod tests {
         )
         .unwrap();
         assert!(Request::next(&root).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn share_log_retains_recent_events_after_rotation() {
+        let root = std::env::temp_dir().join(format!(
+            "clip-share-log-{:016x}",
+            u64::from_ne_bytes(crate::private::random().unwrap())
+        ));
+        let first = serde_json::json!({"event": "progress"});
+        append_log(&root, &first).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("share.log"))
+            .unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        file.set_len(256 * 1024).unwrap();
+        let failure = serde_json::json!({"event": "failed"});
+        append_log(&root, &failure).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("share.log")).unwrap(),
+            format!("{failure}\n")
+        );
+        assert_eq!(
+            std::fs::metadata(root.join("share.previous.log"))
+                .unwrap()
+                .len(),
+            256 * 1024
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -105,6 +105,14 @@ final class ShareViewController: NSViewController {
     private let closeButton = NSButton(title: "", target: nil, action: nil)
     private let progress = NSProgressIndicator(frame: .zero)
     private let progressLabel = NSTextField(labelWithString: "")
+    private let speedLabel = NSTextField(labelWithString: "—")
+    private let byteFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowsNonnumericFormatting = false
+        return formatter
+    }()
+    private var speedSample: (bytes: Int64, time: TimeInterval)?
     private var completed = false
     private var closed = false
     private var lastRefresh = Date.distantPast
@@ -158,10 +166,15 @@ final class ShareViewController: NSViewController {
         progress.minValue = 0
         progress.maxValue = 100
         progress.isHidden = true
-        progressLabel.frame = NSRect(x: 24, y: 34, width: 352, height: 20)
+        progressLabel.frame = NSRect(x: 24, y: 34, width: 240, height: 20)
         progressLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         progressLabel.textColor = .secondaryLabelColor
         progressLabel.isHidden = true
+        speedLabel.frame = NSRect(x: 272, y: 34, width: 104, height: 20)
+        speedLabel.alignment = .right
+        speedLabel.font = progressLabel.font
+        speedLabel.textColor = .secondaryLabelColor
+        speedLabel.isHidden = true
         closeButton.frame = NSRect(x: 350, y: 330, width: 28, height: 28)
         closeButton.isBordered = false
         closeButton.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "关闭")
@@ -171,7 +184,7 @@ final class ShareViewController: NSViewController {
         closeButton.keyEquivalent = "\u{1b}"
         closeButton.target = self
         closeButton.action = #selector(close)
-        [icon, title, label, deviceHeading, deviceScroll, progress, progressLabel, closeButton].forEach { view.addSubview($0) }
+        [icon, title, label, deviceHeading, deviceScroll, progress, progressLabel, speedLabel, closeButton].forEach { view.addSubview($0) }
 
     }
     override func viewDidAppear() {
@@ -380,12 +393,13 @@ final class ShareViewController: NSViewController {
             started = Date()
             progress.isHidden = false
             progressLabel.isHidden = false
+            speedLabel.isHidden = false
             updateProgress(sent: 0)
             deviceChanged()
             label.stringValue = "正在连接所选设备…\n尚未开始发送文件。"
         } catch { fail("无法提交分享：\(error.localizedDescription)") }
     }
-    private func poll() {
+    private func poll(samplingAt uptime: TimeInterval = ProcessInfo.processInfo.systemUptime) {
         guard !finished, let directory = directory else { return }
         if !submitted {
             if Date().timeIntervalSince(lastRefresh) >= 8 { refreshDevices() }
@@ -400,7 +414,7 @@ final class ShareViewController: NSViewController {
             case "waiting": label.stringValue = "分享请求已发出，等待手机接受…\n如手机显示接收提示，请确认。"
             case "sending":
                 let sent = (status["sent"] as? NSNumber)?.int64Value ?? 0
-                updateProgress(sent: sent)
+                updateProgress(sent: sent, samplingAt: uptime)
                 label.stringValue = "正在发送到设备…"
             case "completed":
                 timer?.invalidate()
@@ -408,6 +422,7 @@ final class ShareViewController: NSViewController {
                 completed = true
                 finished = true
                 updateProgress(sent: total)
+                speedLabel.isHidden = true
                 deviceChanged()
                 cleanup()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.close() }
@@ -438,18 +453,32 @@ final class ShareViewController: NSViewController {
         finished = true
         deviceChanged()
         label.stringValue = message
+        speedLabel.isHidden = true
         cleanup()
     }
-    private func updateProgress(sent: Int64) {
+    private func updateProgress(sent: Int64, samplingAt uptime: TimeInterval? = nil) {
         let bytes = max(0, min(sent, total))
         let percent = total == 0 ? (completed ? 100.0 : 0.0) : Double(bytes) / Double(total) * 100
         progress.doubleValue = percent
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        formatter.allowsNonnumericFormatting = false
-        progressLabel.stringValue = "\(formatter.string(fromByteCount: bytes)) / \(formatter.string(fromByteCount: total)) · \(Int(percent))%"
+        progressLabel.stringValue = "\(byteFormatter.string(fromByteCount: bytes)) / \(byteFormatter.string(fromByteCount: total)) · \(Int(percent))%"
         progressLabel.toolTip = "已发送 \(bytes) 字节，共 \(total) 字节"
         progress.setAccessibilityValue("\(Int(percent))%")
+        if let uptime = uptime {
+            updateSpeed(bytes: bytes, at: uptime)
+        }
+    }
+    private func updateSpeed(bytes: Int64, at uptime: TimeInterval) {
+        guard let previous = speedSample, bytes >= previous.bytes else {
+            speedSample = (bytes, uptime)
+            speedLabel.stringValue = "—"
+            return
+        }
+        let interval = uptime - previous.time
+        guard interval >= 1 else { return }
+        let rate = (Double(bytes - previous.bytes) / interval).rounded(.down)
+        let bytesPerSecond = Int64(exactly: rate) ?? Int64.max
+        speedLabel.stringValue = "\(byteFormatter.string(fromByteCount: bytesPerSecond))/s"
+        speedSample = (bytes, uptime)
     }
     #if SHARE_PREVIEW
     static func verifyPreview(output: URL, icon: URL) throws {
@@ -505,15 +534,25 @@ final class ShareViewController: NSViewController {
         precondition(request["target"] as? String == "192.0.2.1:1234")
         controller.selectDevice(controller.deviceButtons[1])
         precondition(controller.selectedEndpoint == "192.0.2.1:1234", "Repeated clicks must not switch an active transfer")
+        try JSONSerialization.data(withJSONObject: ["state": "sending", "sent": 0]).write(to: ready.appendingPathComponent("status.json"))
+        controller.poll(samplingAt: 1)
         try JSONSerialization.data(withJSONObject: ["state": "sending", "sent": 524288]).write(to: ready.appendingPathComponent("status.json"))
-        controller.poll()
+        controller.poll(samplingAt: 2)
         precondition(controller.progress.doubleValue == 50)
+        precondition(controller.progressLabel.stringValue.hasSuffix("50%"))
+        precondition(controller.progressLabel.frame.maxX < controller.speedLabel.frame.minX)
+        precondition(controller.progressLabel.frame.midY == controller.speedLabel.frame.midY)
+        precondition(controller.speedLabel.alignment == .right && !controller.speedLabel.isHidden)
+        precondition(controller.speedLabel.stringValue == "\(controller.byteFormatter.string(fromByteCount: 524288))/s")
         precondition(controller.deviceButtons[1].isHidden)
         try snapshot("sending.png")
+        controller.poll(samplingAt: 3)
+        precondition(controller.speedLabel.stringValue == "\(controller.byteFormatter.string(fromByteCount: 0))/s")
         try JSONSerialization.data(withJSONObject: ["state": "completed"]).write(to: ready.appendingPathComponent("status.json"))
         controller.poll()
         precondition(controller.completed && controller.finished)
         precondition(controller.progress.doubleValue == 100)
+        precondition(controller.speedLabel.isHidden)
         precondition(!FileManager.default.fileExists(atPath: ready.path))
         // Exercise the scheduled automatic dismissal, without a phone or host app.
         RunLoop.current.run(until: Date().addingTimeInterval(0.6))
