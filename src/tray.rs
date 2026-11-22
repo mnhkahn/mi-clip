@@ -52,6 +52,7 @@ pub(crate) enum TrayEvent {
     RefreshDevices,
     Capture,
     CaptureSettings,
+    ClipboardHistory,
     Discovering,
     Devices(Result<Vec<crate::devices::Device>, ()>),
     SessionStatus(std::net::SocketAddr, &'static str, String),
@@ -610,6 +611,13 @@ use std::time::Duration;
                         } else {
                             crate::capture::settings();
                         }
+                        return Ok(());
+                    }
+                    TrayEvent::ClipboardHistory => {
+                        if let Some(opened) = panel.as_ref() {
+                            opened.update(cx, |panel, window, _| hide_popup(panel, window))??;
+                        }
+                        crate::clipboard_history::open();
                         return Ok(());
                     }
                     TrayEvent::RefreshDevices => {

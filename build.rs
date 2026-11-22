@@ -5,6 +5,9 @@ fn main() {
     println!("cargo:rerun-if-changed=macos/UpdateProxy.swift");
     println!("cargo:rerun-if-changed=macos/LoginItem.swift");
     println!("cargo:rerun-if-changed=macos/Notifications.swift");
+    println!("cargo:rerun-if-changed=macos/ClipboardHistory.swift");
+    println!("cargo:rerun-if-changed=macos/ClipboardHistoryStore.swift");
+    println!("cargo:rerun-if-changed=macos/GitHubSocialPreview.swift");
     if env::var_os("CARGO_FEATURE_UI").is_none() {
         return;
     }
@@ -32,6 +35,9 @@ fn main() {
             "macos/UpdateProxy.swift",
             "macos/LoginItem.swift",
             "macos/Notifications.swift",
+            "macos/ClipboardHistory.swift",
+            "macos/ClipboardHistoryStore.swift",
+            "macos/GitHubSocialPreview.swift",
             "-o",
         ])
         .arg(output.join("libclip_capture.a"))
@@ -71,6 +77,7 @@ fn main() {
         "CFNetwork",
         "ServiceManagement",
         "UserNotifications",
+        "QuickLookThumbnailing",
     ] {
         println!("cargo:rustc-link-lib=framework={framework}");
     }

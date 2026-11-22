@@ -35,3 +35,5 @@
 
 !/build.rs
 !/tests/capture_test.swift
+
+!/tests/clipboard_history_test.swift

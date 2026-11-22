@@ -1,5 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 mod capture;
+mod clipboard_history;
 mod devices;
 mod login_item;
 mod notifications;
@@ -128,6 +129,7 @@ fn main() -> anyhow::Result<()> {
             gpui_rhai::install(cx);
             if !smoke {
                 capture::start();
+                clipboard_history::start();
             }
             let quitting = background.clone();
             let mut instance = _instance;
@@ -137,6 +139,7 @@ fn main() -> anyhow::Result<()> {
             cx.on_app_quit(move |_| {
                 if !smoke {
                     capture::stop();
+                    clipboard_history::stop();
                 }
                 quitting
                     .stop

@@ -65,7 +65,7 @@ pub const PANEL_WIDTH: f32 = 280.0;
 pub fn panel_size(detail: &str) -> gpui_rhai::gpui::Size<gpui_rhai::gpui::Pixels> {
     gpui_rhai::gpui::size(
         px(PANEL_WIDTH),
-        px(content_height(detail) + 40.0 + 28.0 + 32.0 + 232.0),
+        px(content_height(detail) + 40.0 + 28.0 + 32.0 + 32.0 + 232.0),
     )
 }
 
@@ -388,6 +388,23 @@ impl Render for Panel {
                                 }))
                                 .child("截图快捷键设置"),
                         ),
+                )
+                .child(
+                    div()
+                        .id("clipboard-history")
+                        .h(px(32.0))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .px(px(14.0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgba(0x2b3038ff)))
+                        .on_click(cx.listener(|panel, _, _, _| {
+                            let _ = panel
+                                .events
+                                .try_send(crate::tray::TrayEvent::ClipboardHistory);
+                        }))
+                        .child("剪贴板历史"),
                 )
                 .child(
                     div()
