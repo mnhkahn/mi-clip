@@ -69,6 +69,24 @@ fn main() {
         String::from_utf8(sdk.stdout).unwrap().trim()
     );
     println!("cargo:rustc-link-lib=static=clip_capture");
+    // rustc's -nodefaultlibs skips Clang's builtins. SwiftUI availability
+    // checks emitted by Xcode 16.4 need __isPlatformVersionAtLeast from them.
+    let clang_runtime = Command::new("xcrun")
+        .args(["clang", "--print-file-name=libclang_rt.osx.a"])
+        .output()
+        .expect("Clang is required to link the Swift bridge");
+    let clang_runtime_path = String::from_utf8(clang_runtime.stdout).unwrap();
+    let clang_runtime_path = std::path::Path::new(clang_runtime_path.trim());
+    assert!(
+        clang_runtime.status.success()
+            && clang_runtime_path.is_absolute()
+            && clang_runtime_path.is_file(),
+        "Clang did not locate libclang_rt.osx.a"
+    );
+    println!(
+        "cargo:rustc-link-arg-bin=mi-clip={}",
+        clang_runtime_path.display()
+    );
     for framework in [
         "Cocoa",
         "Carbon",
