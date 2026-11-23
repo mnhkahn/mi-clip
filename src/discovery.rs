@@ -6,6 +6,7 @@ use std::{
     collections::HashSet,
     ffi::{CStr, c_char, c_void},
     net::{SocketAddr, ToSocketAddrs, UdpSocket},
+    path::PathBuf,
     time::{Duration, Instant},
 };
 type Service = *mut c_void;
@@ -79,21 +80,22 @@ pub struct Endpoint {
 }
 impl Endpoint {
     pub fn remote_addresses(&self) -> impl Iterator<Item = SocketAddr> {
-        (self.host.as_str(), self.kcp_port)
-            .to_socket_addrs()
+        enabled()
+            .then(|| (self.host.as_str(), self.kcp_port).to_socket_addrs())
             .into_iter()
+            .flatten()
             .flatten()
             .filter(|address| !is_local_address(*address))
     }
 }
-#[derive(Default)]
-struct State {
+struct State<'a> {
+    active: &'a dyn Fn() -> bool,
     services: Vec<Service>,
     seen: HashSet<(u32, Vec<u8>)>,
     endpoints: Vec<Endpoint>,
     failed: bool,
 }
-impl Drop for State {
+impl Drop for State<'_> {
     fn drop(&mut self) {
         for &service in &self.services {
             unsafe {
@@ -117,7 +119,7 @@ unsafe extern "C" fn resolved(
     if error != 0 || host.is_null() || txt.is_null() {
         return;
     }
-    let state = unsafe { &mut *(context as *mut State) };
+    let state = unsafe { &mut *(context as *mut State<'_>) };
     let mut length = 0;
     let value = unsafe { TXTRecordGetValuePtr(size, txt.cast(), c"AppData".as_ptr(), &mut length) };
     if value.is_null() || length == 0 {
@@ -169,8 +171,9 @@ unsafe extern "C" fn browsed(
     if error != 0 || flags & 2 == 0 || name.is_null() || kind.is_null() || domain.is_null() {
         return;
     }
-    let state = unsafe { &mut *(context as *mut State) };
-    if state.services.len() >= 65
+    let state = unsafe { &mut *(context as *mut State<'_>) };
+    if !(state.active)()
+        || state.services.len() >= 65
         || !state.seen.insert((
             interface,
             (unsafe { CStr::from_ptr(name) }).to_bytes().to_vec(),
@@ -206,13 +209,47 @@ pub fn is_local_address(mut address: SocketAddr) -> bool {
     UdpSocket::bind(address).is_ok()
 }
 
+fn preference_path() -> Option<PathBuf> {
+    Some(
+        PathBuf::from(std::env::var_os("HOME")?)
+            .join("Library/Application Support/MiClip/lan-discovery"),
+    )
+}
+
+pub fn enabled() -> bool {
+    preference_path()
+        .and_then(|path| std::fs::read(path).ok())
+        .is_some_and(|value| value == b"on\n")
+}
+
+pub fn set_enabled(enabled: bool) -> anyhow::Result<()> {
+    let path = preference_path().ok_or_else(|| anyhow::anyhow!("Home directory unavailable"))?;
+    crate::private::save(&path, if enabled { b"on\n" } else { b"off\n" })
+}
+
 pub fn discover(timeout: Duration) -> anyhow::Result<Vec<Endpoint>> {
+    discover_while(timeout, &|| true)
+}
+
+/// The caller can cancel its current scan without changing the saved preference.
+pub fn discover_while(
+    timeout: Duration,
+    current: &dyn Fn() -> bool,
+) -> anyhow::Result<Vec<Endpoint>> {
+    let active = || current() && enabled();
+    anyhow::ensure!(active(), "LAN discovery is disabled");
     anyhow::ensure!(
         timeout <= Duration::from_secs(30),
         "Discovery timeout exceeds limit"
     );
-    let mut state = Box::<State>::default();
-    let context = (&mut *state as *mut State).cast();
+    let mut state = Box::new(State {
+        active: &active,
+        services: Vec::new(),
+        seen: HashSet::new(),
+        endpoints: Vec::new(),
+        failed: false,
+    });
+    let context = (&mut *state as *mut State<'_>).cast();
     let mut service = std::ptr::null_mut();
     let error = unsafe {
         DNSServiceBrowse(
@@ -228,7 +265,7 @@ pub fn discover(timeout: Duration) -> anyhow::Result<Vec<Endpoint>> {
     anyhow::ensure!(error == 0, "System DNS-SD browse failed ({error})");
     state.services.push(service);
     let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
+    while active() && Instant::now() < deadline {
         let refs = state.services.clone();
         let mut fds: Vec<PollFd> = refs
             .iter()
@@ -259,6 +296,9 @@ pub fn discover(timeout: Duration) -> anyhow::Result<Vec<Endpoint>> {
             anyhow::bail!("DNS-SD socket polling failed");
         }
         for (fd, service) in fds.iter().zip(refs) {
+            if !active() {
+                break;
+            }
             anyhow::ensure!(fd.revents & (8 | 16 | 32) == 0, "DNS-SD socket closed");
             if fd.revents & 1 != 0 && unsafe { DNSServiceProcessResult(service) } != 0 {
                 state.failed = true;
@@ -266,12 +306,20 @@ pub fn discover(timeout: Duration) -> anyhow::Result<Vec<Endpoint>> {
         }
         anyhow::ensure!(!state.failed, "System DNS-SD response failed");
     }
+    anyhow::ensure!(active(), "LAN discovery stopped");
     Ok(std::mem::take(&mut state.endpoints))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancelled_discovery_returns_before_opening_a_browse_socket() {
+        // The caller can cancel before discovery even validates its timeout.
+        let error = discover_while(Duration::MAX, &|| false).err().unwrap();
+        assert_eq!(error.to_string(), "LAN discovery is disabled");
+    }
+
     #[test]
     fn excludes_this_mac_without_excluding_other_computers() {
         for address in ["127.0.0.1:1234", "[::1]:1234", "0.0.0.0:1234"] {

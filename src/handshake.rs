@@ -643,10 +643,14 @@ fn exchange(
         .services
         .get_or_insert_with(crate::networking::Service::local_services);
     let selected_target = target;
-    if stop.is_some() && selected_target.is_none() {
-        if let Ok(endpoints) = crate::discovery::discover(Duration::from_secs(3)) {
+    if let Some(stop) = stop
+        && selected_target.is_none()
+    {
+        let active = || !stop.load(std::sync::atomic::Ordering::Relaxed);
+        if let Ok(endpoints) = crate::discovery::discover_while(Duration::from_secs(3), &active) {
             if let Some(address) = endpoints
                 .iter()
+                .take_while(|_| active())
                 .flat_map(crate::discovery::Endpoint::remote_addresses)
                 .find(|a| a.is_ipv4())
             {

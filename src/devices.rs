@@ -5,7 +5,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -38,6 +38,8 @@ impl Device {
 }
 #[derive(Clone, Default)]
 pub(crate) struct Devices {
+    pub enabled: bool,
+    pub preference_failed: bool,
     pub entries: Vec<Device>,
     pub scanning: bool,
     pub failed: bool,
@@ -91,12 +93,48 @@ fn session_label(status: &str, detail: &str) -> String {
     }
 }
 
-pub fn start(events: Sender<TrayEvent>, stop: Arc<AtomicBool>) -> mpsc::SyncSender<()> {
+// Even generations are disabled. Each transition invalidates any scan and
+// results still queued from the preceding enabled generation.
+pub(crate) struct ScanControl(AtomicU64);
+
+impl ScanControl {
+    pub fn new(enabled: bool) -> Self {
+        Self(AtomicU64::new(u64::from(enabled)))
+    }
+
+    pub fn generation(&self) -> Option<u64> {
+        let generation = self.0.load(Ordering::Acquire);
+        (generation % 2 == 1).then_some(generation)
+    }
+
+    pub fn toggle(&self) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+pub fn start(
+    events: Sender<TrayEvent>,
+    stop: Arc<AtomicBool>,
+    control: Arc<ScanControl>,
+) -> mpsc::SyncSender<()> {
     let (request, receiver) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
+        let mut previous = None;
         let mut next_scan = Instant::now();
         while !stop.load(Ordering::Relaxed) {
-            if Instant::now() < next_scan && !mi_clip::share_queue::take_device_refresh() {
+            let Some(generation) = control.generation() else {
+                if mi_clip::share_queue::take_device_refresh() {
+                    let _ = events.send_blocking(TrayEvent::RefreshDevices);
+                }
+                if receiver.recv_timeout(Duration::from_millis(250))
+                    == Err(mpsc::RecvTimeoutError::Disconnected)
+                {
+                    break;
+                }
+                continue;
+            };
+            let share_refresh = mi_clip::share_queue::take_device_refresh();
+            if previous == Some(generation) && Instant::now() < next_scan && !share_refresh {
                 match receiver.recv_timeout(Duration::from_millis(250)) {
                     Ok(()) => (),
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -104,11 +142,20 @@ pub fn start(events: Sender<TrayEvent>, stop: Arc<AtomicBool>) -> mpsc::SyncSend
                 }
             }
             while receiver.try_recv().is_ok() {}
-            let _ = events.send_blocking(TrayEvent::Discovering);
-            let result = mi_clip::discovery::discover(Duration::from_secs(5))
+            let active =
+                || !stop.load(Ordering::Relaxed) && control.generation() == Some(generation);
+            if !active() {
+                continue;
+            }
+            previous = Some(generation);
+            let _ = events.send_blocking(TrayEvent::Discovering(generation));
+            let result = mi_clip::discovery::discover_while(Duration::from_secs(5), &active)
                 .map(|endpoints| {
                     let mut devices = Vec::new();
                     for endpoint in endpoints {
+                        if !active() {
+                            break;
+                        }
                         // Interfaces may produce duplicate records for one device.
                         if devices.iter().any(|d: &Device| {
                             d.host == endpoint.host && d.port == endpoint.kcp_port
@@ -134,39 +181,51 @@ pub fn start(events: Sender<TrayEvent>, stop: Arc<AtomicBool>) -> mpsc::SyncSend
                     devices
                 })
                 .map_err(|_| ());
-            let catalogue = result
-                .as_ref()
-                .map(|devices| {
-                    devices
-                        .iter()
-                        .filter_map(|device| {
-                            device
-                                .addresses
-                                .iter()
-                                .find(|a| a.is_ipv4())
-                                .or_else(|| device.addresses.first())
-                                .map(|endpoint| mi_clip::share_queue::ShareDevice {
-                                    name: device.name.clone(),
-                                    device_type: device.device_type,
-                                    endpoint: *endpoint,
-                                })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if let Err(error) = mi_clip::share_queue::publish_devices(catalogue) {
-                eprintln!("Mi Clip share device list unavailable: {error:#}");
+            if active() {
+                let _ = events.send_blocking(TrayEvent::Devices(generation, result));
             }
-            let _ = events.send_blocking(TrayEvent::Devices(result));
             next_scan = Instant::now() + Duration::from_secs(15);
         }
     });
     request
 }
 
+pub fn publish_catalogue(devices: &[Device]) {
+    let catalogue = devices
+        .iter()
+        .filter_map(|device| {
+            device
+                .addresses
+                .iter()
+                .find(|a| a.is_ipv4())
+                .or_else(|| device.addresses.first())
+                .map(|endpoint| mi_clip::share_queue::ShareDevice {
+                    name: device.name.clone(),
+                    device_type: device.device_type,
+                    endpoint: *endpoint,
+                })
+        })
+        .collect();
+    if let Err(error) = mi_clip::share_queue::publish_devices(catalogue) {
+        eprintln!("Mi Clip share device list unavailable: {error:#}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn disabling_invalidates_in_flight_scans_even_after_reenabling() {
+        let control = ScanControl::new(false);
+        assert_eq!(control.generation(), None);
+        control.toggle();
+        let first = control.generation().unwrap();
+        control.toggle();
+        assert_eq!(control.generation(), None);
+        control.toggle();
+        assert_ne!(control.generation().unwrap(), first);
+    }
+
     #[test]
     fn tablet_and_phone_keep_independent_connection_states() {
         let phone = "192.0.2.1:1234".parse().unwrap();

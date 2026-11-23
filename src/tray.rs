@@ -50,11 +50,12 @@ pub(crate) enum TrayEvent {
     AnimationTick,
     CheckUpdate,
     RefreshDevices,
+    ToggleDiscovery,
     Capture,
     CaptureSettings,
     ClipboardHistory,
-    Discovering,
-    Devices(Result<Vec<crate::devices::Device>, ()>),
+    Discovering(u64),
+    Devices(u64, Result<Vec<crate::devices::Device>, ()>),
     SessionStatus(std::net::SocketAddr, &'static str, String),
     Update(crate::update_ui::Notice),
 }
@@ -206,6 +207,11 @@ pub fn install(
     }
     let (sender, receiver) = async_channel::bounded(32);
     let testing = smoke.is_some();
+    let discovery_enabled = testing || mi_clip::discovery::enabled();
+    let discovery = std::sync::Arc::new(crate::devices::ScanControl::new(discovery_enabled));
+    if !testing {
+        crate::devices::publish_catalogue(&[]);
+    }
     let action = TrayAction::new(mtm, sender.clone());
     let stop = runtime.stop.clone();
     if let Some(config) = config {
@@ -214,7 +220,11 @@ pub fn install(
     let discovery_request = if testing {
         None
     } else {
-        Some(crate::devices::start(sender.clone(), stop.clone()))
+        Some(crate::devices::start(
+            sender.clone(),
+            stop.clone(),
+            discovery.clone(),
+        ))
     };
     let update_request = Some(if smoke.is_none() {
         crate::update_ui::start(sender.clone(), stop.clone())
@@ -233,7 +243,11 @@ pub fn install(
     image.setSize(NSSize::new(18.0, 18.0));
     image.setTemplate(true);
     button.setImage(Some(&image));
-    button.setToolTip(Some(ns_string!("Mi Clip · 尚未连接")));
+    button.setToolTip(Some(if discovery_enabled {
+        ns_string!("Mi Clip · 尚未连接")
+    } else {
+        ns_string!("Mi Clip · 扫描已关闭")
+    }));
     // SAFETY: The target is retained for the entire event loop. Selector signature
     // matches the action method above; Cocoa supplies the status button as sender.
     unsafe {
@@ -332,7 +346,7 @@ use std::time::Duration;
                 }
                 // Populate enough synthetic peers to exercise the scroll area.
                 test_events
-                    .send(TrayEvent::Devices(Ok((0..8)
+                    .send(TrayEvent::Devices(1, Ok((0..8)
                         .map(|i| crate::devices::Device {
                             name: format!("测试设备 {i}"),
                             host: format!("fixture-{i}.local."),
@@ -543,9 +557,22 @@ use std::time::Duration;
         let mut animation_pending = false;
         let mut last_notification: Option<Instant> = None;
         let mut panel: Option<WindowHandle<Panel>> = None;
-        let mut devices = crate::devices::Devices::default();
-        let mut status_text = "尚未连接";
-        let mut detail_text = "请先完成设备登录".to_owned();
+        let mut devices = crate::devices::Devices {
+            enabled: discovery_enabled,
+            ..Default::default()
+        };
+        let mut connection_status = "尚未连接";
+        let mut connection_detail = "请先完成设备登录".to_owned();
+        let mut status_text = if discovery_enabled {
+            connection_status
+        } else {
+            "扫描已关闭"
+        };
+        let mut detail_text = if discovery_enabled {
+            connection_detail.clone()
+        } else {
+            String::new()
+        };
         let mut update_text = if std::env::var_os("MICLIP_UPDATE_ROLLBACK").is_some() {
             "更新失败，重试".to_owned()
         } else {
@@ -594,6 +621,36 @@ use std::time::Duration;
             };
 
             let result = cx.update(|cx| -> anyhow::Result<()> {
+                let event = if matches!(event, TrayEvent::ToggleDiscovery) {
+                    let enabled = !devices.enabled;
+                    let saved = if testing {
+                        Ok(())
+                    } else {
+                        mi_clip::discovery::set_enabled(enabled)
+                    };
+                    devices.preference_failed = saved.is_err();
+                    if let Err(error) = saved {
+                        eprintln!("Mi Clip discovery preference could not be saved: {error:#}");
+                    } else {
+                        discovery.toggle();
+                        devices.enabled = enabled;
+                        devices.scanning = false;
+                        devices.failed = false;
+                        devices.entries.clear();
+                        if !testing {
+                            crate::devices::publish_catalogue(&[]);
+                        }
+                        if let Some(request) = &discovery_request {
+                            let _ = request.try_send(());
+                        }
+                    }
+                    if let Some(opened) = panel.as_ref() {
+                        opened.update(cx, |panel, _, cx| panel.set_devices(devices.clone(), cx))?;
+                    }
+                    TrayEvent::Status(connection_status, connection_detail.clone())
+                } else {
+                    event
+                };
                 let anchor = match event {
                     TrayEvent::Toggle(anchor) => anchor,
                     TrayEvent::Close => {
@@ -621,12 +678,18 @@ use std::time::Duration;
                         return Ok(());
                     }
                     TrayEvent::RefreshDevices => {
-                        if let Some(request) = &discovery_request {
+                        if !testing && !devices.enabled {
+                            crate::devices::publish_catalogue(&[]);
+                        } else if let Some(request) = &discovery_request {
                             let _ = request.try_send(());
                         }
                         return Ok(());
                     }
-                    TrayEvent::Discovering => {
+                    TrayEvent::ToggleDiscovery => unreachable!(),
+                    TrayEvent::Discovering(generation) => {
+                        if discovery.generation() != Some(generation) {
+                            return Ok(());
+                        }
                         devices.scanning = true;
                         if let Some(opened) = panel.as_ref() {
                             let _ = opened
@@ -634,7 +697,15 @@ use std::time::Duration;
                         }
                         return Ok(());
                     }
-                    TrayEvent::Devices(result) => {
+                    TrayEvent::Devices(generation, result) => {
+                        if discovery.generation() != Some(generation) {
+                            return Ok(());
+                        }
+                        if !testing {
+                            crate::devices::publish_catalogue(
+                                result.as_deref().unwrap_or_default(),
+                            );
+                        }
                         devices.scanning = false;
                         devices.failed = result.is_err();
                         if let Ok(entries) = result {
@@ -700,11 +771,18 @@ use std::time::Duration;
                         if std::env::var_os("MICLIP_DIAGNOSTICS").is_some() {
                             println!("Mi Clip state: {status}; {detail}");
                         }
-                        status_text = status;
-                        detail_text = detail;
+                        connection_status = status;
+                        connection_detail = detail;
+                        if devices.enabled || status == "已连接" {
+                            status_text = status;
+                            detail_text = connection_detail.clone();
+                        } else {
+                            status_text = "扫描已关闭";
+                            detail_text.clear();
+                        }
                         let detail = visible_detail(&feedback, &detail_text);
                         button.setToolTip(Some(&objc2_foundation::NSString::from_str(&format!(
-                            "Mi Clip · {status}{}",
+                            "Mi Clip · {status_text}{}",
                             if detail.is_empty() {
                                 String::new()
                             } else {
@@ -810,7 +888,9 @@ use std::time::Duration;
                         return Ok(());
                     }
                 }
-                if let Some(request) = &discovery_request {
+                if devices.enabled
+                    && let Some(request) = &discovery_request
+                {
                     let _ = request.try_send(());
                 }
                 let detail = visible_detail(&feedback, &detail_text);

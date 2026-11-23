@@ -285,20 +285,24 @@ final class ShareViewController: NSViewController {
     @objc private func refreshDevices() {
         guard !submitted, let directory = directory else { return }
         lastRefresh = Date()
+        guard readDevices() else { return }
         try? Data().write(to: directory.deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("refresh-devices"), options: .atomic)
-        readDevices()
     }
-    private func readDevices() {
-        guard !submitted, let directory = directory else { return }
+    @discardableResult
+    private func readDevices() -> Bool {
+        guard !submitted, let directory = directory else { return false }
         let path = directory.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("devices.json")
         var entries: [[String: Any]] = []
+        var discoveryEnabled = true
         if let data = try? Data(contentsOf: path),
-           let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-           let updated = (json["updated"] as? NSNumber)?.doubleValue,
-           Date().timeIntervalSince1970 - updated < 45 {
-            catalogueUpdated = Date(timeIntervalSince1970: updated)
-            entries = json["devices"] as? [[String: Any]] ?? []
+           let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            discoveryEnabled = json["discovery_enabled"] as? Bool ?? true
+            if let updated = (json["updated"] as? NSNumber)?.doubleValue,
+               Date().timeIntervalSince1970 - updated < 45 {
+                catalogueUpdated = Date(timeIntervalSince1970: updated)
+                entries = json["devices"] as? [[String: Any]] ?? []
+            }
         }
         let signature = entries.map { "\($0["endpoint"] ?? ""): \($0["name"] ?? ""): \($0["device_type"] ?? 1)" }.joined(separator: "|")
         if signature != catalogueSignature || (choices.isEmpty && !entries.isEmpty) {
@@ -310,8 +314,13 @@ final class ShareViewController: NSViewController {
             renderDevices()
             catalogueSignature = signature
         }
-        if entries.isEmpty { emptyDevices.stringValue = "正在搜索设备…\n请解锁手机并开启互联。" }
+        if entries.isEmpty {
+            emptyDevices.stringValue = discoveryEnabled
+                ? "正在搜索设备…\n请解锁手机并开启互联。"
+                : "局域网扫描已关闭。\n请在 Mi Clip 菜单栏面板开启。"
+        }
         deviceChanged()
+        return discoveryEnabled
     }
     private func renderDevices() {
         deviceButtons.forEach { $0.removeFromSuperview() }
@@ -497,14 +506,24 @@ final class ShareViewController: NSViewController {
         controller.total = 1048576
         controller.label.stringValue = "已准备 1 个文件 · 点击设备即可发送。"
         (controller.view.subviews.first as? NSImageView)?.image = NSImage(contentsOf: icon)
-        let catalogue: [String: Any] = ["updated": Date().timeIntervalSince1970, "devices": [
+        let catalogueURL = root.appendingPathComponent("devices.json")
+        try JSONSerialization.data(withJSONObject: [
+            "updated": Date().timeIntervalSince1970, "discovery_enabled": false, "devices": []
+        ]).write(to: catalogueURL)
+        let refreshURL = root.appendingPathComponent("refresh-devices")
+        controller.refreshDevices()
+        precondition(!FileManager.default.fileExists(atPath: refreshURL.path))
+        precondition(controller.deviceButtons.isEmpty)
+        precondition(controller.emptyDevices.stringValue.contains("局域网扫描已关闭"))
+        let catalogue: [String: Any] = ["updated": Date().timeIntervalSince1970, "discovery_enabled": true, "devices": [
             ["endpoint": "192.0.2.1:1234", "name": "Xiaomi 15 Pro", "device_type": 1],
             ["endpoint": "192.0.2.2:1234", "name": "Redmi Pad", "device_type": 2],
             ["endpoint": "192.0.2.3:1234", "name": "MacBook Pro", "device_type": 2],
         ]]
-        try JSONSerialization.data(withJSONObject: catalogue).write(to: root.appendingPathComponent("devices.json"))
+        try JSONSerialization.data(withJSONObject: catalogue).write(to: catalogueURL)
+        controller.lastRefresh = .distantPast
         controller.poll()
-        precondition(FileManager.default.fileExists(atPath: root.appendingPathComponent("refresh-devices").path), "Opening must automatically request discovery")
+        precondition(FileManager.default.fileExists(atPath: refreshURL.path), "Opening must automatically request discovery")
         precondition(controller.deviceButtons.count == 3)
         precondition(controller.choices.map { $0.brand } == [.xiaomi, .redmi, .apple])
         precondition(controller.choices[1].detail == "Redmi · 平板电脑")

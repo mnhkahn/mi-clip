@@ -230,11 +230,22 @@ impl Render for Panel {
                 .child(format!("界面加载失败：{error}"))
                 .into_any_element(),
         };
-        let rows = self.devices.rows(&self.status);
+        let discovery_enabled = self.devices.enabled;
+        let discovery_switch = if discovery_enabled {
+            div().justify_end()
+        } else {
+            div().justify_start()
+        };
+        let rows = if discovery_enabled {
+            self.devices.rows(&self.status)
+        } else {
+            Vec::new()
+        };
         let empty = rows.is_empty();
         let mut list = div()
             .id("device-list")
             .flex_1()
+            .min_w(px(0.0))
             .min_h(px(0.0))
             .overflow_y_scroll();
         for (name, detail) in rows {
@@ -256,7 +267,9 @@ impl Render for Panel {
         }
         if empty {
             list = list.child(div().py(px(12.0)).text_color(rgba(0xa4acbaff)).child(
-                if self.devices.scanning {
+                if !discovery_enabled {
+                    "开启后自动发现同一局域网的设备"
+                } else if self.devices.scanning {
                     "正在发现局域网设备…"
                 } else if self.devices.failed {
                     "暂未发现设备"
@@ -266,7 +279,11 @@ impl Render for Panel {
             ));
         }
         let has_device = !self.devices.entries.is_empty();
-        let discovery_note = if self.devices.failed && has_device {
+        let discovery_note = if self.devices.preference_failed {
+            "无法保存开关设置 · 点击重试"
+        } else if !discovery_enabled {
+            ""
+        } else if self.devices.failed && has_device {
             "暂时无法刷新 · 显示上次发现的设备"
         } else if self.status == "已连接" {
             "双方认证通过 · 连接已建立"
@@ -437,35 +454,64 @@ impl Render for Panel {
                                 .justify_between()
                                 .child("局域网设备")
                                 .child(
-                                    div()
-                                        .id("refresh-devices")
-                                        .cursor_pointer()
-                                        .px(px(6.0))
-                                        .py(px(5.0))
-                                        .rounded(px(4.0))
-                                        .hover(|s| s.bg(rgba(0x2b3038ff)))
-                                        .on_click(cx.listener(|panel, _, _, cx| {
-                                            if !panel.devices.scanning {
-                                                if panel
-                                                    .events
-                                                    .try_send(
-                                                        crate::tray::TrayEvent::RefreshDevices,
-                                                    )
-                                                    .is_ok()
-                                                {
-                                                    panel.devices.scanning = true;
-                                                    cx.notify();
-                                                }
-                                            }
-                                        }))
-                                        .child(if self.devices.scanning {
-                                            "发现中…"
+                                    discovery_switch
+                                        .id("toggle-discovery")
+                                        .w(px(34.0))
+                                        .h(px(18.0))
+                                        .flex()
+                                        .items_center()
+                                        .px(px(2.0))
+                                        .rounded(px(9.0))
+                                        .bg(if discovery_enabled {
+                                            rgba(0x63d5b0ff)
                                         } else {
-                                            "刷新"
-                                        }),
+                                            rgba(0x484f5aff)
+                                        })
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|panel, _, _, _| {
+                                            let _ = panel
+                                                .events
+                                                .try_send(crate::tray::TrayEvent::ToggleDiscovery);
+                                        }))
+                                        .child(div().size(px(14.0)).rounded(px(7.0)).bg(
+                                            if discovery_enabled {
+                                                rgba(0x10251fff)
+                                            } else {
+                                                rgba(0xf0f2f5ff)
+                                            },
+                                        )),
                                 ),
                         )
-                        .child(list)
+                        .child(div().flex().flex_1().min_h(px(0.0)).child(list).children(
+                            discovery_enabled.then(|| {
+                                div()
+                                    .id("refresh-devices")
+                                    .self_start()
+                                    .flex_shrink_0()
+                                    .cursor_pointer()
+                                    .mt(px(2.0))
+                                    .px(px(6.0))
+                                    .py(px(5.0))
+                                    .rounded(px(4.0))
+                                    .hover(|s| s.bg(rgba(0x2b3038ff)))
+                                    .on_click(cx.listener(|panel, _, _, cx| {
+                                        if !panel.devices.scanning
+                                            && panel
+                                                .events
+                                                .try_send(crate::tray::TrayEvent::RefreshDevices)
+                                                .is_ok()
+                                        {
+                                            panel.devices.scanning = true;
+                                            cx.notify();
+                                        }
+                                    }))
+                                    .child(if self.devices.scanning {
+                                        "发现中…"
+                                    } else {
+                                        "刷新"
+                                    })
+                            }),
+                        ))
                         .child(
                             div()
                                 .flex_shrink_0()

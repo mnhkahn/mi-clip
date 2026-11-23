@@ -364,7 +364,11 @@ fn write_devices(mut devices: Vec<ShareDevice>) -> anyhow::Result<()> {
         .as_secs();
     crate::private::save(
         &root.join("devices.json"),
-        &serde_json::to_vec(&serde_json::json!({"updated": now, "devices": devices}))?,
+        &serde_json::to_vec(&serde_json::json!({
+            "updated": now,
+            "discovery_enabled": crate::discovery::enabled(),
+            "devices": devices,
+        }))?,
     )
 }
 
