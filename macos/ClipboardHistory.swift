@@ -43,8 +43,10 @@ private final class ClipboardHistoryController: NSObject, ObservableObject, NSWi
     private var hotkeyHandler: EventHandlerRef?
     private var previousApp: NSRunningApplication?
     private var previewRequest = 0
+    private var pendingRestore: Bool?
     private var githubTask: Task<Void, Never>?
     private var pasteRequest = 0
+    private var didPromptForAccessibility = false
 
     var shortcut: String? { hotkey == nil ? nil : "⌥·" }
     var visibleRecords: [ClipboardRecord] {
@@ -146,8 +148,8 @@ private final class ClipboardHistoryController: NSObject, ObservableObject, NSWi
             poll()
             query = ""
             filter = nil
-            select(records.first?.id)
             installKeyMonitor()
+            select(records.first?.id)
             if panel == nil {
                 let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 700, height: 400),
                                     styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
@@ -188,9 +190,17 @@ private final class ClipboardHistoryController: NSObject, ObservableObject, NSWi
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor); self.keyMonitor = nil }
         panel?.orderOut(nil)
         panel?.contentView = nil
-        if restoreFocus { previousApp?.activate(options: []) }
+        if restoreFocus, let previousApp {
+            if #available(macOS 14.0, *), NSApp.isActive {
+                NSApp.yieldActivation(to: previousApp)
+                previousApp.activate(from: .current, options: [])
+            } else {
+                previousApp.activate(options: [])
+            }
+        }
         previousApp = nil
         previewRequest += 1
+        pendingRestore = nil
         preview = nil
         details = []
         githubTask?.cancel()
@@ -206,8 +216,9 @@ private final class ClipboardHistoryController: NSObject, ObservableObject, NSWi
     }
 
     func select(_ id: String?) {
-        guard selection != id else { return }
+        guard keyMonitor != nil, selection != id else { return }
         selection = id
+        pendingRestore = nil
         preview = nil
         details = []
         githubTask?.cancel()
@@ -229,8 +240,15 @@ private final class ClipboardHistoryController: NSObject, ObservableObject, NSWi
                 case let .success((items, details)):
                     self.preview = items
                     self.details = details
-                    self.loadGitHubPreviews(items)
-                case .failure: self.status = "无法读取所选项目"
+                    if let paste = self.pendingRestore {
+                        self.pendingRestore = nil
+                        self.restore(paste: paste)
+                    } else {
+                        self.loadGitHubPreviews(items)
+                    }
+                case .failure:
+                    self.pendingRestore = nil
+                    self.status = "无法读取所选项目"
                 }
             }
         }
@@ -281,12 +299,19 @@ private final class ClipboardHistoryController: NSObject, ObservableObject, NSWi
     }
 
     func requestAccessibility() {
+        didPromptForAccessibility = true
         let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
         canPasteDirectly = AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
     }
 
-    func restore(paste: Bool) {
-        guard let preview else { return }
+    func restore(paste: Bool, recordID: String? = nil) {
+        guard keyMonitor != nil else { return }
+        if let recordID { select(recordID) }
+        guard selection != nil else { return }
+        guard let preview else {
+            pendingRestore = paste
+            return
+        }
         let board = NSPasteboard.general
         // Keep a recent copy even if the user restores history before the next tick.
         poll()
@@ -294,14 +319,15 @@ private final class ClipboardHistoryController: NSObject, ObservableObject, NSWi
             status = "macOS 无法恢复此剪贴板项目"
             return
         }
-        lastChange = board.changeCount
+        let count = board.changeCount
+        lastChange = count
         let target = previousApp
-        let canPaste = paste && AXIsProcessTrusted()
         dismiss(restoreFocus: true)
-        if canPaste, let target {
-            pasteRequest += 1
-            pasteWhenActive(target, count: lastChange ?? board.changeCount, request: pasteRequest, remaining: 20)
-        }
+        guard paste, let target else { return }
+        if !AXIsProcessTrusted(), !didPromptForAccessibility { requestAccessibility() }
+        guard AXIsProcessTrusted() else { return }
+        pasteRequest += 1
+        pasteWhenActive(target, count: count, request: pasteRequest, remaining: 20)
     }
 
     private func pasteWhenActive(_ target: NSRunningApplication, count: Int, request: Int, remaining: Int) {
@@ -625,6 +651,9 @@ private struct ClipboardHistoryRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .simultaneousGesture(TapGesture(count: 2).onEnded {
+            model.restore(paste: true, recordID: record.id)
+        })
         .accessibilityAddTraits(selected ? .isSelected : [])
         .task(id: record.id) {
             guard record.kind == .image, record.itemCount == 1 else { return }
