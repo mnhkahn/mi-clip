@@ -476,11 +476,10 @@ private final class SelectionView: NSView {
     let image: CGImage
     let outline = SelectionOutline()
     weak var owner: CaptureController?
-    weak var inlineToolbar: NSView?
     var selection = CGRect.zero
     private var start = CGPoint.zero
     private var original = CGRect.zero
-    private var drag = Drag.new
+    private var drag: Drag?
     private var didDrag = false
     private let handles = [(-1,-1), (0,-1), (1,-1), (-1,0), (1,0), (-1,1), (0,1), (1,1)]
     override var isFlipped: Bool { true }
@@ -491,23 +490,38 @@ private final class SelectionView: NSView {
         outline.selectionView = self
         outline.frame = bounds; outline.autoresizingMask = [.width, .height]
         addSubview(outline)
+        let tracking = NSTrackingArea(rect: .zero, options: [.inVisibleRect, .activeInActiveApp, .mouseMoved, .cursorUpdate],
+                                      owner: self, userInfo: nil)
+        addTrackingArea(tracking)
     }
     required init?(coder: NSCoder) { fatalError() }
-    override func resetCursorRects() {
-        guard let toolbar = inlineToolbar, !toolbar.isHidden, toolbar.superview === self else {
-            addCursorRect(bounds, cursor: .crosshair)
-            return
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.acceptsMouseMovedEvents = true
+    }
+    private func dragMode(at point: CGPoint) -> Drag {
+        if let (x, y) = handle(at: point) { return .resize(x, y) }
+        return selection.contains(point) ? .move : .new
+    }
+    private func cursor(at point: CGPoint) -> NSCursor {
+        if let drag {
+            if case .move = drag { return .closedHand }
+            return .crosshair
         }
-        let bar = toolbar.frame.intersection(bounds)
-        guard !bar.isEmpty else { addCursorRect(bounds, cursor: .crosshair); return }
-        // Keep the crosshair out of the toolbar, including gaps between buttons.
-        for rect in [
-            CGRect(x: bounds.minX, y: bounds.minY, width: bounds.width, height: bar.minY-bounds.minY),
-            CGRect(x: bounds.minX, y: bar.maxY, width: bounds.width, height: bounds.maxY-bar.maxY),
-            CGRect(x: bounds.minX, y: bar.minY, width: bar.minX-bounds.minX, height: bar.height),
-            CGRect(x: bar.maxX, y: bar.minY, width: bounds.maxX-bar.maxX, height: bar.height)
-        ] where !rect.isEmpty { addCursorRect(rect, cursor: .crosshair) }
-        addCursorRect(bar, cursor: .arrow)
+        let hit = hitTest(convert(point, to: superview))
+        if hit === self {
+            if case .move = dragMode(at: point) { return .openHand }
+            return .crosshair
+        }
+        if hit is EditorCanvas { return .crosshair }
+        if hit is NSTextView { return .iBeam }
+        return .arrow
+    }
+    override func cursorUpdate(with event: NSEvent) {
+        cursor(at: convert(event.locationInWindow, from: nil)).set()
+    }
+    override func mouseMoved(with event: NSEvent) {
+        cursorUpdate(with: event)
     }
     override func draw(_ dirtyRect: NSRect) {
         NSImage(cgImage: image, size: bounds.size).draw(in: bounds, from: .zero, operation: .copy, fraction: 1, respectFlipped: true, hints: nil)
@@ -562,11 +576,11 @@ private final class SelectionView: NSView {
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         start = convert(event.locationInWindow, from: nil); original = selection; didDrag = false
-        if let (x, y) = handle(at: start) { drag = .resize(x, y) }
-        else if selection.contains(start) { drag = .move }
-        else { drag = .new }
+        drag = dragMode(at: start)
+        cursorUpdate(with: event)
     }
     override func mouseDragged(with event: NSEvent) {
+        guard let drag else { return }
         let location = convert(event.locationInWindow, from: nil)
         let point = CGPoint(x: min(max(0, location.x), bounds.width), y: min(max(0, location.y), bounds.height))
         didDrag = true
@@ -586,8 +600,13 @@ private final class SelectionView: NSView {
             selection = CGRect(x: min(point.x,start.x), y: min(point.y,start.y), width: abs(point.x-start.x), height: abs(point.y-start.y))
         }
         needsDisplay = true; outline.needsDisplay = true
+        cursorUpdate(with: event)
     }
     override func mouseUp(with event: NSEvent) {
+        defer {
+            drag = nil
+            cursorUpdate(with: event)
+        }
         guard didDrag else { return }
         guard selection.width >= 4 && selection.height >= 4 else {
             selection = original; needsDisplay = true; outline.needsDisplay = true
@@ -744,7 +763,6 @@ private final class EditorController: NSObject, NSWindowDelegate {
         overlay.addSubview(canvas, positioned: .below, relativeTo: overlay.outline)
         overlay.addSubview(bar)
         inlineTools = bar
-        overlay.inlineToolbar = bar
         updateRegion(canvas.document.image, selection: overlay.selection, offset: .zero)
         selectTool()
     }
@@ -770,15 +788,12 @@ private final class EditorController: NSObject, NSWindowDelegate {
             closeStylePickers()
         }
         canvas.isHidden = !visible; inlineTools?.isHidden = !visible
-        if let overlay = canvas.superview { window.invalidateCursorRects(for: overlay) }
     }
     func removeInlineControls() {
         guard isInline else { return }
         closeStylePickers()
         canvas.finishText()
-        let overlay = canvas.superview
         canvas.removeFromSuperview(); inlineTools?.removeFromSuperview()
-        if let overlay { window.invalidateCursorRects(for: overlay) }
     }
     private func closeStylePickers() {
         for picker in [colors, widths, fonts] { picker.close() }
@@ -990,6 +1005,10 @@ func captureRunUITests(image: CGImage, output: URL) throws {
         if start != end { selection.mouseDragged(with: mouse(.leftMouseDragged, in: selection, at: end)) }
         selection.mouseUp(with: mouse(.leftMouseUp, in: selection, at: end))
     }
+    func expectHover(_ cursor: NSCursor, at point: CGPoint) {
+        overlay.sendEvent(mouse(.mouseMoved, in: selection, at: point))
+        precondition(NSCursor.current === cursor, "unexpected hover cursor at \(point)")
+    }
     dragSelection(from: CGPoint(x: 60, y: 60), to: CGPoint(x: 60, y: 60))
     precondition(controller.editor == nil, "an empty click must not capture")
     dragSelection(from: CGPoint(x: 120, y: 60), to: CGPoint(x: 540, y: 360))
@@ -1008,9 +1027,22 @@ func captureRunUITests(image: CGImage, output: URL) throws {
     precondition(selection.bounds.contains(bar.frame) && bar.frame.minY > selection.selection.maxY)
     let movePoint = CGPoint(x: 250, y: 190)
     precondition(selection.hitTest(selection.convert(movePoint, to: selection.superview)) === selection, "unmarked pixels must let the user move the selection")
-    dragSelection(from: movePoint, to: CGPoint(x: 265, y: 205))
+    expectHover(.crosshair, at: CGPoint(x: 60, y: 60))
+    expectHover(.crosshair, at: CGPoint(x: selection.selection.minX, y: selection.selection.midY))
+    expectHover(.arrow, at: CGPoint(x: bar.frame.minX+2, y: bar.frame.midY))
+    expectHover(.openHand, at: movePoint)
+    let moveEnd = CGPoint(x: 265, y: 205)
+    selection.mouseDown(with: mouse(.leftMouseDown, in: selection, at: movePoint))
+    precondition(NSCursor.current === NSCursor.closedHand)
+    selection.mouseDragged(with: mouse(.leftMouseDragged, in: selection, at: moveEnd))
+    precondition(NSCursor.current === NSCursor.closedHand)
+    selection.mouseUp(with: mouse(.leftMouseUp, in: selection, at: moveEnd))
+    precondition(NSCursor.current === NSCursor.openHand)
     precondition(controller.editor === inline && selection.selection.origin == CGPoint(x: 135, y: 75))
+    expectHover(.crosshair, at: CGPoint(x: 125, y: 190))
+    expectHover(.openHand, at: CGPoint(x: 545, y: 190))
     inline.rectTool()
+    expectHover(.crosshair, at: moveEnd)
     inline.widths.popover.animates = false
     inline.widths.button.performClick(nil)
     precondition(inline.widths.popover.isShown, "stroke previews must open on the capture overlay")
