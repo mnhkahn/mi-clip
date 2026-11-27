@@ -5,6 +5,8 @@
 !/Cargo.lock
 !/README.md
 !/LICENSE
+!/docs/
+!/docs/transfer-protocol.md
 !/.github/
 !/.github/workflows/
 !/.github/workflows/release.yml
